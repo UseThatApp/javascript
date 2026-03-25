@@ -1,0 +1,44 @@
+{
+  "name": "usethatapp",
+  "version": "0.1.0",
+  "description": "For use in your UseThatApp Web Apps",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "UseThatApp",
+    "JavaScript",
+    "Web Apps"
+  ],
+  "license": "MIT",
+  "author": "UseThatApp <support@usethatapp.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/UseThatApp/javascript.git"
+  },
+  "bugs": {
+    "url": "https://github.com/UseThatApp/javascript/issues"
+  },
+  "homepage": "https://github.com/UseThatApp/javascript",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "test:compat": "node scripts/compat-test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "typescript": "^5.8.2"
+  }
+}
