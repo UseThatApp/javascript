@@ -9,6 +9,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./webapps": {
+      "types": "./dist/webapps.d.ts",
+      "import": "./dist/webapps.js"
     }
   },
   "files": [

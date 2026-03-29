@@ -22,7 +22,7 @@ Load the UseThatApp script on the client, then pass the message from your fronte
 
 ```javascript
 import express from "express";
-import { getProduct } from "usethatapp";
+import { getProduct } from "usethatapp/webapps";
 
 const app = express();
 app.use(express.json());
@@ -45,7 +45,7 @@ app.post("/license", (req, res) => {
 ### Example (plain Node)
 
 ```javascript
-import { getProduct } from "usethatapp";
+import { getProduct } from "usethatapp/webapps";
 
 const message = process.env.UTA_MESSAGE_JSON; // or object from your web layer
 const product = getProduct(
