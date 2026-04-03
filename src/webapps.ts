@@ -24,7 +24,7 @@ export type ProductMessage = {
 /**
  * Verify a hex signature and decrypt a hex-encoded encrypted message from a JSON message.
  */
-export function getProduct(
+export function getVersion(
   message: string | ProductMessage,
   publicKeyPath: string,
   privateKeyPath: string,

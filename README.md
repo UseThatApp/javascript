@@ -16,13 +16,13 @@ The published package ships compiled ESM under `dist/`. There are no runtime dep
 
 ## Usage
 
-Load the UseThatApp script on the client, then pass the message from your frontend into the server and call `getProduct` with your PEM key paths.
+Load the UseThatApp script on the client, then pass the message from your frontend into the server and call `getVersion` with your PEM key paths.
 
 ### Example (Express)
 
 ```javascript
 import express from "express";
-import { getProduct } from "usethatapp/webapps";
+import { getVersion } from "usethatapp/webapps";
 
 const app = express();
 app.use(express.json());
@@ -30,7 +30,7 @@ app.use(express.json());
 app.post("/license", (req, res) => {
   try {
     const message = req.body?.message ?? req.body;
-    const product = getProduct(
+    const product = getVersion(
       message,
       process.env.USETHATAPP_PUBLIC_KEY_PEM_PATH,
       process.env.MY_UTA_PRIVATE_KEY_PEM_PATH,
@@ -45,10 +45,10 @@ app.post("/license", (req, res) => {
 ### Example (plain Node)
 
 ```javascript
-import { getProduct } from "usethatapp/webapps";
+import { getVersion } from "usethatapp/webapps";
 
 const message = process.env.UTA_MESSAGE_JSON; // or object from your web layer
-const product = getProduct(
+const product = getVersion(
   message,
   "/path/to/UseThatApp_public.pem",
   "/path/to/my_UTA_private.pem",
@@ -58,7 +58,7 @@ console.log(product);
 
 ### Message shape
 
-`getProduct` accepts either a **JSON string** or an object with:
+`getVersion` accepts either a **JSON string** or an object with:
 
 | Field | Description |
 |--------|-------------|
@@ -70,7 +70,7 @@ On success you get a UTF-8 `string` when decoding succeeds, otherwise a `Buffer`
 
 ## API
 
-### `getProduct(message, publicKeyPath, privateKeyPath, encoding?)`
+### `getVersion(message, publicKeyPath, privateKeyPath, encoding?)`
 
 - **message** — `string` (JSON) or `ProductMessage` object  
 - **publicKeyPath** — filesystem path to the UseThatApp **public** PEM (signature verification)  
@@ -105,7 +105,7 @@ npm install
 npm run build
 ```
 
-- **`npm run test:compat`** — builds a signed+encrypted payload with Node’s `crypto` and checks that `getProduct` verifies and decrypts it.
+- **`npm run test:compat`** — builds a signed+encrypted payload with Node’s `crypto` and checks that `getVersion` verifies and decrypts it.
 
 ## Changelog
 

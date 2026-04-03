@@ -3,4 +3,4 @@ export {
   verifySignature,
   Keys,
 } from "./encryption.js";
-export { getProduct, type ProductMessage } from "./webapps.js";
+export { getVersion, type ProductMessage } from "./webapps.js";

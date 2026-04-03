@@ -7,7 +7,7 @@ import {
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getProduct } from "../dist/index.js";
+import { getVersion } from "../dist/index.js";
 
 const dir = mkdtempSync(join(tmpdir(), "uta-"));
 const pubPath = join(dir, "pub.pem");
@@ -45,9 +45,9 @@ const message = JSON.stringify({
   contents: encrypted.toString("hex"),
 });
 
-const out = getProduct(message, pubPath, privPath);
+const out = getVersion(message, pubPath, privPath);
 if (out !== "Pro") {
   console.error("expected Pro, got", out);
   process.exit(1);
 }
-console.log("compat ok: getProduct verifies PSS and decrypts OAEP payload");
+console.log("compat ok: getVersion verifies PSS and decrypts OAEP payload");
