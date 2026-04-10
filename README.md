@@ -16,7 +16,7 @@ The published package ships compiled ESM under `dist/`. There are no runtime dep
 
 ## Usage
 
-Load the UseThatApp script on the client, then pass the message from your frontend into the server and call `getVersion` with your PEM key paths.
+Load the UseThatApp script on the client, then pass the envelope from `requestAccessLevel()` into the server and call `getVersion` with your PEM key paths.
 
 ### Example (Express)
 
@@ -29,9 +29,9 @@ app.use(express.json());
 
 app.post("/license", (req, res) => {
   try {
-    const message = req.body?.message ?? req.body;
+    const envelope = req.body;
     const product = getVersion(
-      message,
+      envelope,
       process.env.USETHATAPP_PUBLIC_KEY_PEM_PATH,
       process.env.MY_UTA_PRIVATE_KEY_PEM_PATH,
     );
@@ -47,37 +47,44 @@ app.post("/license", (req, res) => {
 ```javascript
 import { getVersion } from "usethatapp/webapps";
 
-const message = process.env.UTA_MESSAGE_JSON; // or object from your web layer
+const envelope = process.env.UTA_ENVELOPE_JSON; // or object from your web layer
 const product = getVersion(
-  message,
+  envelope,
   "/path/to/UseThatApp_public.pem",
   "/path/to/my_UTA_private.pem",
 );
 console.log(product);
 ```
 
-### Message shape
+### Envelope shape
 
-`getVersion` accepts either a **JSON string** or an object with:
+`getVersion` accepts either a **JSON string** or an `Envelope` object — the full postMessage envelope returned by `requestAccessLevel()`:
+
+| Field | Description |
+|--------|-------------|
+| `type` | `"level"` for a successful response; `"error"` for an error |
+| `responseTo` | The request ID (optional) |
+| `message` | A `ProductMessage` object with `contents` and `signature` |
+
+The inner `ProductMessage` has:
 
 | Field | Description |
 |--------|-------------|
 | `signature` | Hex string (optional `0x` prefix) |
-| `contents` | Hex-encoded ciphertext (preferred) |
-| `content` | Same as `contents` if you need the alternate key |
+| `contents` | Hex-encoded ciphertext |
 
 On success you get a UTF-8 `string` when decoding succeeds, otherwise a `Buffer`.
 
 ## API
 
-### `getVersion(message, publicKeyPath, privateKeyPath, encoding?)`
+### `getVersion(envelope, publicKeyPath, privateKeyPath, encoding?)`
 
-- **message** — `string` (JSON) or `ProductMessage` object  
+- **envelope** — `string` (JSON) or `Envelope` object (the full response from `requestAccessLevel()`)  
 - **publicKeyPath** — filesystem path to the UseThatApp **public** PEM (signature verification)  
 - **privateKeyPath** — filesystem path to **your** private PEM (decryption)  
 - **encoding** — optional `BufferEncoding` for the decrypted payload (default `"utf8"`)
 
-Throws `Error` for invalid JSON, bad hex, verification failure, missing fields, or key read errors.
+Throws `Error` for invalid JSON, bad hex, verification failure, missing fields, error envelopes, or key read errors.
 
 ### Lower-level exports
 
@@ -88,7 +95,7 @@ Useful if you already load keys yourself:
 - **`verifySignature(publicKey, signature, message)`** — `Buffer` inputs  
 - **`decryptMessage(privateKey, encrypted)`** — returns `Buffer`  
 
-Types are published in `dist/*.d.ts`; import `type { ProductMessage }` when you need the message type.
+Types are published in `dist/*.d.ts`; import `type { ProductMessage, Envelope }` when you need the message types.
 
 ## Client script
 
@@ -109,7 +116,14 @@ npm run build
 
 ## Changelog
 
-### 0.1.0
+### 0.2.0
+
+- **Breaking:** `getVersion()` now expects the full `Envelope` from `requestAccessLevel()` instead of the inner `ProductMessage`
+- Added `Envelope` type export
+- Error envelopes (`type: "error"`) are now detected and throw with the server's error description
+- Removed support for the `content` alternate key; use `contents` only
+
+### 0.1.1
 
 - Initial release
 

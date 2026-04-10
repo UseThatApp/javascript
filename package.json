@@ -1,6 +1,6 @@
 {
   "name": "usethatapp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "For use in your UseThatApp Web Apps",
   "type": "module",
   "main": "./dist/index.js",
@@ -27,7 +27,7 @@
   "author": "UseThatApp <support@usethatapp.com>",
   "repository": {
     "type": "git",
-    "url": "https://github.com/UseThatApp/javascript.git"
+    "url": "git+https://github.com/UseThatApp/javascript.git"
   },
   "bugs": {
     "url": "https://github.com/UseThatApp/javascript/issues"

@@ -40,12 +40,15 @@ const signature = sign("sha256", encrypted, {
   saltLength: constants.RSA_PSS_SALTLEN_MAX_SIGN,
 });
 
-const message = JSON.stringify({
-  signature: signature.toString("hex"),
-  contents: encrypted.toString("hex"),
+const envelope = JSON.stringify({
+  type: "level",
+  message: {
+    signature: signature.toString("hex"),
+    contents: encrypted.toString("hex"),
+  },
 });
 
-const out = getVersion(message, pubPath, privPath);
+const out = getVersion(envelope, pubPath, privPath);
 if (out !== "Pro") {
   console.error("expected Pro, got", out);
   process.exit(1);
