@@ -1,7 +1,7 @@
 {
   "name": "usethatapp",
-  "version": "0.2.0",
-  "description": "For use in your UseThatApp Web Apps",
+  "version": "1.0.0",
+  "description": "JavaScript/TypeScript SDK for usethatapp.com — verifies launch envelopes and queries license tiers.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -9,10 +9,6 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
-    },
-    "./webapps": {
-      "types": "./dist/webapps.d.ts",
-      "import": "./dist/webapps.js"
     }
   },
   "files": [
@@ -39,10 +35,16 @@
   "scripts": {
     "build": "tsc",
     "prepublishOnly": "npm run build",
-    "test:compat": "node scripts/compat-test.mjs"
+    "test:compat": "node scripts/compat-test.mjs",
+    "test:examples": "node scripts/example-tests.mjs",
+    "test": "npm run build && npm run test:compat && npm run test:examples"
   },
   "devDependencies": {
+    "@fastify/formbody": "^8.0.1",
     "@types/node": "^22.13.10",
+    "express": "^4.21.2",
+    "fastify": "^5.2.1",
+    "h3": "^1.13.1",
     "typescript": "^5.8.2"
   }
 }
