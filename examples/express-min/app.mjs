@@ -1,23 +1,62 @@
-// Express launch endpoint using the bundled `utaLaunchView` helper.
-// The helper enforces POST-only, returns 400 on bad envelopes, and
-// attaches the verified `UtaUser` to `req.utaUser`.
+// Minimal Express app: UseThatApp OIDC login + entitlement (docs only).
+// The SDK ships no framework code — this shows the three bits you wire
+// yourself: read callback params, store flowState in the session, redirect.
+//
+//   npm install usethatapp express express-session
+//   export UTA_CLIENT_ID=... UTA_CLIENT_SECRET=... UTA_REDIRECT_URI=http://localhost:3000/callback
+//   node app.mjs
 
 import express from "express";
+import session from "express-session";
 
-import { getVersion, utaLaunchView } from "usethatapp";
+import { beginLogin, completeLogin, getEntitlement, logoutUrl, UtaError } from "usethatapp";
 
 export function createApp() {
   const app = express();
-  app.use(express.urlencoded({ extended: false })); // marketplace posts form data
-  app.use(express.json());
+  app.use(session({ secret: process.env.SESSION_SECRET ?? "dev-only", resave: false, saveUninitialized: true }));
 
-  app.post(
-    "/launch",
-    utaLaunchView(async (req, user, res) => {
-      const version = await getVersion(user.user_key);
-      res.json({ user_key: user.user_key, version });
-    }),
-  );
+  app.get("/login", async (req, res, next) => {
+    try {
+      const { authorizationUrl, flowState } = await beginLogin();
+      req.session.utaFlow = flowState;
+      res.redirect(authorizationUrl);
+    } catch (e) { next(e); }
+  });
+
+  app.get("/callback", async (req, res) => {
+    try {
+      const s = await completeLogin({
+        code: req.query.code,
+        state: req.query.state,
+        flowState: req.session.utaFlow,
+      });
+      delete req.session.utaFlow;
+      req.session.utaSub = s.sub;
+      req.session.utaAccessToken = s.access_token;
+      req.session.utaIdToken = s.id_token;
+      res.redirect("/");
+    } catch (e) {
+      const code = e instanceof UtaError ? 400 : 500;
+      res.status(code).send(`login failed: ${e.message}`);
+    }
+  });
+
+  app.get("/", async (req, res, next) => {
+    try {
+      const token = req.session.utaAccessToken;
+      if (!token) return res.send('<a href="/login">Log in with UseThatApp</a>');
+      const ent = await getEntitlement(token);
+      res.json({ sub: req.session.utaSub, entitlement: ent.raw });
+    } catch (e) { next(e); }
+  });
+
+  app.get("/logout", async (req, res, next) => {
+    try {
+      const idToken = req.session.utaIdToken;
+      req.session.destroy(() => {});
+      res.redirect(await logoutUrl({ idToken, postLogoutRedirectUri: "http://localhost:3000/" }));
+    } catch (e) { next(e); }
+  });
 
   return app;
 }

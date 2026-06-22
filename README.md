@@ -1,35 +1,35 @@
 # usethatapp
 
 JavaScript/TypeScript SDK for [usethatapp.com](https://usethatapp.com).
-Verifies the encrypted+signed *launch envelope* the marketplace POSTs to
-your app and lets you pull the user's current license tier on demand.
+usethatapp.com is an **OpenID Connect provider**: this SDK logs a user in
+through the marketplace, identifies them by a privacy-preserving `sub`, and
+tells you their **live license entitlement** for your app.
 
-**Framework-friendly.** Ships a thin Express helper (`utaLaunchView`) on
-top of a framework-agnostic core (`getUser`, `getVersion`).
-No runtime dependencies — uses Node's built-in `crypto` and `fetch`.
+**Framework-agnostic.** The SDK never touches your web framework — it takes
+and returns plain strings and one JSON-serializable `flowState` object. You
+wire the three framework-specific bits yourself (read the callback query
+params, store `flowState` in your session, issue the redirect). One runtime
+dependency: [`jose`](https://github.com/panva/jose) for ID-token validation.
 
-> **v1.0 is a breaking rewrite.** The old browser-side `usethatapp.js`
-> / `requestAccessLevel()` / iframe handshake has been removed. See
-> [CHANGELOG.md](#changelog) below for migration notes.
+> **v2.0 is a breaking rewrite.** The v1 launch-envelope / `user_key` /
+> `getVersion` handoff is replaced by standard OAuth2/OIDC. See the
+> *Migrating from v1* section and the changelog below.
 
-**Requires:** Node.js 18+ (Node 20+ recommended; uses global `fetch`).
+**Requires:** Node.js 18+ (uses global `fetch` and WebCrypto).
 
 ## How it works
 
-usethatapp.com uses a two-phase, license-centric handoff:
+1. **Login (redirect).** Start a login with `beginLogin()`, send the user to
+   usethatapp.com to authenticate, and finish in your callback with
+   `completeLogin()`. You get a session carrying the user's `sub` (a stable,
+   **per-app**, pseudonymous id — no PII) and OAuth tokens.
+2. **Entitlement (Bearer query).** Call `getEntitlement(accessToken)`
+   whenever you need the user's current license. Always authoritative — a
+   canceled license stops being entitled immediately.
 
-1. **Launch (one-way push).** When a user clicks *Launch app* on
-   usethatapp.com, the marketplace POSTs an encrypted+signed envelope
-   to your app's URL. The envelope carries an opaque `user_key`. Your
-   app verifies + decrypts it, persists `user_key` against its own
-   session, and renders your UI.
-2. **Query (server-to-server pull).** Whenever your app needs the
-   user's current license tier, it POSTs a signed request to
-   `https://usethatapp.com/licensing/getversion/` with the `user_key`
-   and gets back the live product name (or `null`).
-
-Envelope crypto: `RSA-OAEP-SHA256 + AES-256-GCM + RSA-PSS-SHA256`. The
-PSS signature covers `ek || iv || ct`.
+`sub` is **pairwise**: stable for a user within *your* app, different in
+every other app, so it can't be correlated across apps. Use it as your local
+user key — and key off `sub`, never an email (we never share one).
 
 ## Install
 
@@ -39,213 +39,140 @@ npm install usethatapp
 
 ## Settings
 
-The SDK reads from `process.env` by default. You can also override any
-setting programmatically with `configure({...})`.
+Read from `process.env` by default; override any setting with `configure({...})`.
 
-| Name                          | Required | Purpose                                                                  |
-|-------------------------------|----------|--------------------------------------------------------------------------|
-| `UTA_APP_ID`                  | yes      | Your app's UUID on usethatapp.com.                                       |
-| `UTA_PRIVATE_KEY`             | yes†     | Your RSA-2048 private key, PEM string (literal `\n` escapes supported).  |
-| `UTA_PRIVATE_KEY_PATH`        | yes†     | Filesystem path to a PEM file containing the private key. †Set this *or* `UTA_PRIVATE_KEY`. |
-| `UTA_MARKET_PUBLIC_KEY`       | yes*     | Marketplace public key, PEM string. *A production default is bundled.   |
-| `UTA_MARKET_PUBLIC_KEY_PATH`  | no       | Filesystem path to a PEM file containing the marketplace public key (alternative to `UTA_MARKET_PUBLIC_KEY`). |
-| `UTA_API_URL`                 | no       | Defaults to `https://usethatapp.com`.                                    |
-| `UTA_CLOCK_SKEW_SECONDS`      | no       | Defaults to `60`.                                                        |
-| `UTA_REQUEST_TIMEOUT_SECONDS` | no       | Defaults to `10`.                                                        |
-
-The `*_PATH` variants are intended for hosting providers that mount
-secret files into the container (Render Secret Files, Fly.io volumes,
-Kubernetes secret volumes, etc.). The SDK reads the file at boot via
-`fs.readFileSync`. If both the direct setting and the path setting
-are provided for the same key, the direct value wins.
+| Name                          | Required | Purpose                                                       |
+|-------------------------------|----------|---------------------------------------------------------------|
+| `UTA_CLIENT_ID`               | yes      | Your app's OAuth client id (from the dashboard).             |
+| `UTA_REDIRECT_URI`            | yes      | Your registered callback URL.                                |
+| `UTA_CLIENT_SECRET`           | yes*     | Client secret. *Omit for a public (browser/native) PKCE client.|
+| `UTA_CLIENT_SECRET_PATH`      | no       | Read the secret from a mounted file instead (Render/k8s/Fly).|
+| `UTA_ISSUER`                  | no       | Defaults to `https://www.usethatapp.com/o`.                  |
+| `UTA_API_URL`                 | no       | Defaults to `https://www.usethatapp.com`.                    |
+| `UTA_SCOPES`                  | no       | Defaults to `openid entitlements`.                           |
+| `UTA_CLOCK_SKEW_SECONDS`      | no       | ID-token validation leeway. Defaults to `60`.                |
+| `UTA_REQUEST_TIMEOUT_SECONDS` | no       | Defaults to `10`.                                            |
 
 ## Public API
 
 ```ts
 import {
-  getUser,               // framework-agnostic: takes the raw uta_payload string/object
-  getUserFromRequest,    // Express/Connect-style helper (reads req.body.uta_payload)
-  getVersion,            // signed server-to-server license-tier lookup
-  clearVersionCache,
-  utaLaunchView,         // Express handler wrapper
+  beginLogin,      // () => { authorizationUrl, flowState }
+  completeLogin,   // ({ code, state, flowState }) => UtaSession
+  getEntitlement,  // (accessToken) => Entitlement
+  refresh,         // (refreshToken) => UtaSession
+  userinfo,        // (accessToken) => { sub }
+  logoutUrl,       // ({ idToken, postLogoutRedirectUri }) => string
   configure, resetConfig,
-  // types & errors:
-  type UtaUser,
-  UtaError, UtaSignatureError, UtaPayloadExpiredError,
-  UtaAppMismatchError, UtaBadRequestError, UtaSessionRevokedError,
-  UtaUnknownSessionError, UtaServerError, UtaConfigError,
+  type UtaSession, type Entitlement, type UtaFlowState,
+  // errors:
+  UtaError, UtaConfigError, UtaDiscoveryError, UtaAuthError,
+  UtaTokenError, UtaPermissionError, UtaServerError,
 } from "usethatapp";
 ```
 
-`UtaUser` carries only the opaque `user_key` — no PII. Persist it
-against your own session and pass it to `getVersion` whenever you need
-the live license tier.
-
-```ts
-interface UtaUser {
-  readonly user_key: string;
-  readonly app_id: string;
-  readonly issued_at: number;   // unix seconds
-  readonly expires_at: number;  // unix seconds
-  readonly version_hint: string | null;
-}
-```
-
-## Quickstart — Express
+## Quickstart — any framework
 
 ```js
-import express from "express";
-import { utaLaunchView, getVersion } from "usethatapp";
+import { beginLogin, completeLogin, getEntitlement } from "usethatapp";
 
-const app = express();
-app.use(express.urlencoded({ extended: false }));
+// 1) Start login — however your framework spells "redirect":
+const { authorizationUrl, flowState } = await beginLogin();
+saveToSession("utaFlow", flowState);        // JSON-serializable
+res.redirect(authorizationUrl);
 
-// Launch endpoint — POST'd by usethatapp.com.
-app.post("/launch", utaLaunchView(async (req, utaUser, res) => {
-  req.session.utaUserKey = utaUser.user_key;          // persist
-  const version = await getVersion(utaUser.user_key); // live tier
-  res.send(`Welcome — your tier is ${version ?? "(none)"}.`);
-}));
-
-// Anywhere else, look up the live tier on demand.
-app.get("/api/whatever", async (req, res) => {
-  const version = await getVersion(req.session.utaUserKey);
-  res.json({ version });
+// 2) In your callback (reads ?code=...&state=... off the request):
+const session = await completeLogin({
+  code: req.query.code,
+  state: req.query.state,
+  flowState: loadFromSession("utaFlow"),
 });
+saveToSession("utaSub", session.sub);
+saveToSession("utaAccessToken", session.access_token);
 
-app.listen(3000);
+// 3) Anywhere you gate features:
+const ent = await getEntitlement(loadFromSession("utaAccessToken"));
+if (ent.entitled && ent.product_id === "...") { /* ... */ }
 ```
 
-## Quickstart — any Node framework
-
-```js
-import { getUser, getVersion, UtaError } from "usethatapp";
-
-// In your POST handler — however your framework spells body parsing:
-try {
-  const utaUser = getUser(req.body.uta_payload);
-  session.utaUserKey = utaUser.user_key;
-} catch (e) {
-  if (e instanceof UtaError) return badRequest(e.message);
-  throw e;
-}
-
-// Later, anywhere in your app:
-const version = await getVersion(session.utaUserKey); // string | null
-```
-
-> `utaUser.version_hint` is **not** the source of truth. Use it only
-> for first paint. The authoritative value comes from
-> `getVersion(user_key)`.
-
-## Framework examples
-
-Runnable single-file examples for each major Node framework live under
-[`examples/`](./examples/):
-
-- [`examples/node-http-min/`](./examples/node-http-min/) — plain
-  `node:http`, no framework.
-- [`examples/express-min/`](./examples/express-min/) — Express +
-  `utaLaunchView`.
-- [`examples/fastify-min/`](./examples/fastify-min/) — Fastify +
-  `@fastify/formbody`.
-- [`examples/nextjs-min/`](./examples/nextjs-min/) — Next.js App
-  Router route handler (covers React projects).
-- [`examples/nuxt-min/`](./examples/nuxt-min/) — Nuxt 3 server route
-  via h3 (covers Vue projects).
-
-Each is exercised end-to-end by
-[`scripts/example-tests.mjs`](./scripts/example-tests.mjs) — `npm run
-test:examples`.
+Runnable demos live under [`examples/`](./examples/) — documentation only;
+nothing framework-specific ships in the package.
 
 ## Error mapping
 
-`getVersion` maps server status codes to typed errors:
+`getEntitlement` maps status codes to typed errors:
 
-| Status | Error                    | Meaning                                |
-|--------|--------------------------|----------------------------------------|
-| 400    | `UtaBadRequestError`     | Bad JSON / ts outside window / replay. |
-| 401    | `UtaSignatureError`      | Signature verification failed.         |
-| 403    | `UtaSessionRevokedError` | Treat as "user logged out".            |
-| 404    | `UtaUnknownSessionError` | Unknown `user_key` or `app_id`.        |
-| 5xx    | `UtaServerError`         | Retriable with backoff.                |
+| Status | Error                | Meaning                                        |
+|--------|----------------------|------------------------------------------------|
+| 401    | `UtaTokenError`      | Access token invalid/expired — re-auth/refresh.|
+| 403    | `UtaPermissionError` | Token lacks the `entitlements` scope.          |
+| 400    | `UtaError`           | Client not linked to an app (misconfig).       |
+| 5xx    | `UtaServerError`     | Retriable with backoff.                        |
 
 All inherit from `UtaError` — catch that for a single `catch` clause.
 
-## Programmatic configuration
+## Migrating from v1
 
-For tests or apps that don't read from `process.env`:
+| v1                                       | v2                                              |
+|------------------------------------------|-------------------------------------------------|
+| `getUser(payload)` (decrypt envelope)    | `beginLogin()` + `completeLogin()` (OIDC)       |
+| `UtaUser.user_key`                        | `UtaSession.sub` (pairwise, stable per app)     |
+| `getVersion(userKey) => string`           | `getEntitlement(accessToken) => Entitlement`    |
+| RSA keys (`UTA_PRIVATE_KEY`, market key)  | OAuth client (`UTA_CLIENT_ID`/`UTA_CLIENT_SECRET`)|
+| `UTA_APP_ID`                              | (gone — the client id identifies your app)      |
+| `utaLaunchView` Express helper            | (gone — wire your own callback route)           |
 
-```js
-import { configure } from "usethatapp";
-import { readFileSync } from "node:fs";
-
-configure({
-  app_id: "11111111-2222-3333-4444-555555555555",
-  private_key: readFileSync("./my_private.pem", "utf8"),
-  api_url: "https://staging.usethatapp.com",
-});
-```
+Register an OAuth client and redirect URI in your usethatapp.com developer
+dashboard to get `UTA_CLIENT_ID` / `UTA_CLIENT_SECRET`.
 
 ## Development
 
 ```bash
 npm install
 npm run build
-npm test                # build + compat tests + example tests
-npm run test:compat     # round-trip tests + HTTP mock for getVersion
-npm run test:examples   # exercises every framework example end-to-end
+npm test        # build + node:test suite
 ```
 
 ## Changelog
 
-### 1.0.0
+### 2.0.0
 
-Breaking rewrite for the new usethatapp.com webhook-based handoff.
+Breaking rewrite onto standard OAuth2 / OpenID Connect. usethatapp.com is now
+an OpenID Provider; the SDK is a framework-agnostic OIDC client.
 
 **Removed**
 
-- `usethatapp.js` integration, `requestAccessLevel()` JS bridge, and all
-  iframe / `postMessage` handling.
-- The old `webapps` subpath export and the
-  `getVersion(envelope, publicKeyPath, privateKeyPath)` signature.
-- The `Keys`, `decryptMessage`, `verifySignature` low-level exports —
-  PEM key handling is now internal to `config`.
+- `getUser` / `getUserFromRequest` and the encrypted launch-envelope handling.
+- `getVersion` / `clearVersionCache` and the process-local version cache.
+- `utaLaunchView` Express helper — the SDK ships no framework-specific code.
+- `UtaUser` (and its `user_key` / `version_hint`).
+- RSA-key config (`UTA_PRIVATE_KEY[_PATH]`, `UTA_MARKET_PUBLIC_KEY[_PATH]`)
+  and `UTA_APP_ID`.
 
 **Added**
 
-- `getUser(payload)` — verify + decrypt the launch envelope POSTed by
-  the marketplace. Framework-agnostic; takes the raw `uta_payload`
-  string or already-parsed object.
-- `getUserFromRequest(req)` — Express/Connect-style helper that pulls
-  `uta_payload` from `req.body` and forwards to `getUser`.
-- `getVersion(userKey)` — signed server-to-server POST to
-  `https://usethatapp.com/licensing/getversion/`, returning the current
-  product name or `null`. Honors a process-local TTL cache.
-- `utaLaunchView(handler)` Express helper (POST-only, 400 on bad
-  envelope, attaches `req.utaUser`).
-- `UtaUser` interface (`user_key`, `app_id`, `issued_at`, `expires_at`,
-  `version_hint`).
-- Hybrid envelope crypto:
-  `RSA-OAEP-SHA256 + AES-256-GCM + RSA-PSS-SHA256`. PSS signature now
-  covers `ek || iv || ct` (not the plaintext).
-- Typed error hierarchy under `UtaError`. Every failure mode (local
-  validation + each HTTP status) maps to a specific subclass.
-- `configure({...})` / `resetConfig()` for programmatic settings.
-- `UTA_PRIVATE_KEY_PATH` and `UTA_MARKET_PUBLIC_KEY_PATH` env vars
-  (and `private_key_path` / `market_public_key_path` programmatic
-  overrides) for reading PEM contents from a file at boot — intended
-  for hosting providers that mount secret files into the container.
-  Direct values take precedence when both are set.
+- OIDC login: `beginLogin()` → `{ authorizationUrl, flowState }` (auth code +
+  PKCE); `completeLogin({ code, state, flowState })` → `UtaSession`, validating
+  `state`, exchanging the code, and verifying the ID token (signature via JWKS,
+  `iss`/`aud`/`exp`/`nonce`) with `jose`.
+- `refresh(refreshToken)`, `userinfo(accessToken)`, `logoutUrl({...})`.
+- `getEntitlement(accessToken)` → `Entitlement(entitled, version, product_id,
+  status, is_free, period_end)`, the Bearer replacement for `getVersion`.
+- `UtaSession` (pairwise pseudonymous `sub` + tokens), `Entitlement`,
+  `UtaFlowState`.
+- New config: `UTA_CLIENT_ID`, `UTA_CLIENT_SECRET[_PATH]`, `UTA_REDIRECT_URI`,
+  `UTA_ISSUER`, `UTA_SCOPES`.
+- New typed errors: `UtaDiscoveryError`, `UtaAuthError`, `UtaTokenError`,
+  `UtaPermissionError`.
 
-### 0.2.0
+**Changed**
 
-- Breaking change: `getVersion()` expected the full `Envelope` from
-  `requestAccessLevel()` instead of the inner `ProductMessage`.
+- One runtime dependency: `jose`. Identity is a pairwise, per-app pseudonymous
+  `sub` — stable within your app, uncorrelatable across apps.
 
-### 0.1.1
+### 1.0.0
 
-- Initial release.
+Breaking rewrite for the (now superseded) webhook-based launch-envelope handoff.
 
 ## License
 

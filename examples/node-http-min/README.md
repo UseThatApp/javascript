@@ -1,17 +1,19 @@
 # node-http-min
 
-Smallest possible launch endpoint — uses only Node's built-in `http`
-module. No web framework, no dependencies beyond `usethatapp`.
-
-Demonstrates `getUser(payload)` + `getVersion(user_key)`.
+Smallest possible OIDC login flow — only Node's built-in `http` module, no
+web framework, no dependencies beyond `usethatapp`. Uses a toy in-memory
+cookie session to show the three bits you wire yourself: read callback
+params, store `flowState`, redirect.
 
 ## Run
 
 ```bash
-export UTA_APP_ID=...
-export UTA_PRIVATE_KEY="$(cat my_private.pem)"
+npm install usethatapp
+export UTA_CLIENT_ID=... UTA_CLIENT_SECRET=...
+export UTA_REDIRECT_URI=http://localhost:3000/callback
 node examples/node-http-min/app.mjs
 ```
 
-POSTs to `http://127.0.0.1:3000/launch` are verified; the response is
-`{ user_key, version }`.
+Routes: `/login`, `/callback`, `/logout`, and `/` (shows the entitlement).
+The in-memory session is for illustration only — use a real session store in
+production.
