@@ -24,6 +24,11 @@ export function createApp() {
   });
 
   app.get("/callback", async (req, res) => {
+    // On cancel/deny, OAuth redirects back with ?error=... and no code.
+    if (req.query.error) {
+      delete req.session.utaFlow;
+      return res.redirect("/");
+    }
     try {
       const s = await completeLogin({
         code: req.query.code,

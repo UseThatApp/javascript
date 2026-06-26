@@ -81,7 +81,9 @@ const { authorizationUrl, flowState } = await beginLogin();
 saveToSession("utaFlow", flowState);        // JSON-serializable
 res.redirect(authorizationUrl);
 
-// 2) In your callback (reads ?code=...&state=... off the request):
+// 2) In your callback (reads ?code=...&state=... off the request).
+//    On cancel/deny the provider sends ?error=... and no code — handle it first:
+if (req.query.error) return res.redirect("/");   // login was canceled
 const session = await completeLogin({
   code: req.query.code,
   state: req.query.state,

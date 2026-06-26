@@ -34,6 +34,12 @@ export function createApp() {
         sess.utaFlow = flowState;
         res.writeHead(302, { Location: authorizationUrl }).end();
       } else if (url.pathname === "/callback") {
+        // On cancel/deny, OAuth redirects back with ?error=... and no code.
+        if (url.searchParams.get("error")) {
+          delete sess.utaFlow;
+          res.writeHead(302, { Location: "/" }).end();
+          return;
+        }
         const s = await completeLogin({
           code: url.searchParams.get("code"),
           state: url.searchParams.get("state"),
