@@ -9,7 +9,7 @@
 import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
 
-import { beginLogin, completeLogin, getEntitlement, logoutUrl, UtaError } from "usethatapp";
+import { beginLogin, completeLogin, getEntitlement, logoutUrl, UtaError, UtaTokenError } from "usethatapp";
 
 // Toy server-side session store keyed by a cookie. Use a real session in prod.
 const sessions = new Map();
@@ -51,17 +51,25 @@ export function createApp() {
         sess.utaIdToken = s.id_token;
         res.writeHead(302, { Location: "/" }).end();
       } else if (url.pathname === "/logout") {
+        // Don't clear the session yet — the user may choose "Stay signed in". A
+        // real logout revokes the token, so the next getEntitlement (home) 401s
+        // and we drop it then.
         const idToken = sess.utaIdToken;
-        for (const k of Object.keys(sess)) delete sess[k];
         res.writeHead(302, { Location: await logoutUrl({ idToken }) }).end();
       } else {
-        if (!sess.utaAccessToken) {
-          res.end('<a href="/login">Log in with UseThatApp</a>');
-          return;
+        if (sess.utaAccessToken) {
+          try {
+            const ent = await getEntitlement(sess.utaAccessToken);
+            res.setHeader("Content-Type", "application/json");
+            res.end(JSON.stringify({ sub: sess.utaSub, entitlement: ent.raw }));
+            return;
+          } catch (e) {
+            if (!(e instanceof UtaTokenError)) throw e;
+            // Token revoked/expired (signed out of UseThatApp). Reconcile.
+            delete sess.utaAccessToken; delete sess.utaSub; delete sess.utaIdToken;
+          }
         }
-        const ent = await getEntitlement(sess.utaAccessToken);
-        res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify({ sub: sess.utaSub, entitlement: ent.raw }));
+        res.end('<a href="/login">Log in with UseThatApp</a>');
       }
     } catch (e) {
       res.writeHead(e instanceof UtaError ? 400 : 500).end(`error: ${e.message}`);

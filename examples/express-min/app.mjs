@@ -9,7 +9,7 @@
 import express from "express";
 import session from "express-session";
 
-import { beginLogin, completeLogin, getEntitlement, logoutUrl, UtaError } from "usethatapp";
+import { beginLogin, completeLogin, getEntitlement, logoutUrl, UtaError, UtaTokenError } from "usethatapp";
 
 export function createApp() {
   const app = express();
@@ -47,18 +47,28 @@ export function createApp() {
   });
 
   app.get("/", async (req, res, next) => {
-    try {
-      const token = req.session.utaAccessToken;
-      if (!token) return res.send('<a href="/login">Log in with UseThatApp</a>');
-      const ent = await getEntitlement(token);
-      res.json({ sub: req.session.utaSub, entitlement: ent.raw });
-    } catch (e) { next(e); }
+    const token = req.session.utaAccessToken;
+    if (token) {
+      try {
+        const ent = await getEntitlement(token);
+        return res.json({ sub: req.session.utaSub, entitlement: ent.raw });
+      } catch (e) {
+        if (!(e instanceof UtaTokenError)) return next(e);
+        // Token revoked/expired (signed out of UseThatApp). Reconcile.
+        delete req.session.utaAccessToken;
+        delete req.session.utaSub;
+        delete req.session.utaIdToken;
+      }
+    }
+    res.send('<a href="/login">Log in with UseThatApp</a>');
   });
 
   app.get("/logout", async (req, res, next) => {
     try {
+      // Don't clear the session yet — the user may choose "Stay signed in". A
+      // real logout revokes the token, so the next getEntitlement (home) 401s
+      // and we drop it then.
       const idToken = req.session.utaIdToken;
-      req.session.destroy(() => {});
       res.redirect(await logoutUrl({ idToken, postLogoutRedirectUri: "http://localhost:3000/" }));
     } catch (e) { next(e); }
   });
