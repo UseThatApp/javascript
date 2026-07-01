@@ -1,7 +1,7 @@
 {
   "name": "usethatapp",
-  "version": "1.0.0",
-  "description": "JavaScript/TypeScript SDK for usethatapp.com — verifies launch envelopes and queries license tiers.",
+  "version": "2.0.0",
+  "description": "JavaScript/TypeScript SDK for usethatapp.com — OpenID Connect login and live license entitlement queries.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -35,9 +35,7 @@
   "scripts": {
     "build": "tsc",
     "prepublishOnly": "npm run build",
-    "test:compat": "node scripts/compat-test.mjs",
-    "test:examples": "node scripts/example-tests.mjs",
-    "test": "npm run build && npm run test:compat && npm run test:examples"
+    "test": "npm run build && node --test"
   },
   "devDependencies": {
     "@fastify/formbody": "^8.0.1",
@@ -46,5 +44,8 @@
     "fastify": "^5.2.1",
     "h3": "^1.13.1",
     "typescript": "^5.8.2"
+  },
+  "dependencies": {
+    "jose": "^6.2.3"
   }
 }

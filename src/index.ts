@@ -1,49 +1,37 @@
 export {
-  clearVersionCache,
-  getUserFromRequest,
-  getUser,
-  getVersion,
-  type GetVersionOptions,
-  type UtaRequestLike,
+  beginLogin,
+  completeLogin,
+  getEntitlement,
+  logoutUrl,
+  refresh,
+  userinfo,
+  type BeginLoginOptions,
+  type CompleteLoginArgs,
+  type GetEntitlementOptions,
+  type LogoutUrlOptions,
 } from "./client.js";
 
 export {
   configure,
   loadConfig,
   resetConfig,
-  DEFAULT_MARKET_PUBLIC_KEY_PEM,
+  DEFAULT_API_URL,
+  DEFAULT_ISSUER,
+  DEFAULT_SCOPES,
   type UtaConfig,
   type UtaConfigOverrides,
 } from "./config.js";
 
+export { resetDiscoveryCache, type OidcMetadata } from "./discovery.js";
+
 export {
-  UtaAppMismatchError,
-  UtaBadRequestError,
+  UtaAuthError,
   UtaConfigError,
+  UtaDiscoveryError,
   UtaError,
-  UtaPayloadExpiredError,
+  UtaPermissionError,
   UtaServerError,
-  UtaSessionRevokedError,
-  UtaSignatureError,
-  UtaUnknownSessionError,
+  UtaTokenError,
 } from "./errors.js";
 
-export {
-  utaLaunchView,
-  type UtaLaunchHandler,
-  type UtaLaunchMiddleware,
-  type UtaLaunchRequest,
-  type UtaResponseLike,
-} from "./express-helpers.js";
-
-export {
-  buildPayload,
-  unpackPayload,
-  ALG_LABEL,
-  ENVELOPE_VERSION,
-  type BuildPayloadOptions,
-  type Envelope,
-  type InnerPayload,
-} from "./payloads.js";
-
-export type { UtaUser } from "./types.js";
+export type { Entitlement, UtaFlowState, UtaSession } from "./types.js";

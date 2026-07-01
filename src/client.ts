@@ -1,307 +1,386 @@
-import { constants, randomBytes, sign } from "node:crypto";
+/**
+ * Framework-agnostic OIDC client functions.
+ *
+ * The whole public surface takes/returns primitives (strings + a
+ * JSON-serializable `flowState`), so the SDK never touches your framework.
+ * You wire three things yourself: read `code`/`state` off the callback
+ * request, store/load `flowState` in your session, and issue the redirect.
+ *
+ *   const { authorizationUrl, flowState } = await beginLogin();
+ *   const session = await completeLogin({ code, state, flowState });
+ *   const ent = await getEntitlement(session.access_token);
+ */
+
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+
+import { jwtVerify } from "jose";
 
 import { loadConfig, type UtaConfig } from "./config.js";
+import { getJwks, getMetadata, type OidcMetadata } from "./discovery.js";
 import {
-  UtaAppMismatchError,
-  UtaBadRequestError,
+  UtaAuthError,
   UtaError,
-  UtaPayloadExpiredError,
+  UtaPermissionError,
   UtaServerError,
-  UtaSessionRevokedError,
-  UtaSignatureError,
-  UtaUnknownSessionError,
+  UtaTokenError,
 } from "./errors.js";
-import { unpackPayload, type InnerPayload } from "./payloads.js";
-import type { UtaUser } from "./types.js";
+import { errMessage, fetchWithTimeout } from "./http.js";
+import type { Entitlement, UtaFlowState, UtaSession } from "./types.js";
 
-const GETVERSION_PATH = "/licensing/getversion/";
-
-// Process-local TTL cache: { user_key: { version, expires_at_unix_seconds } }
-type CacheEntry = { version: string | null; expires_at: number };
-const versionCache: Map<string, CacheEntry> = new Map();
+const ENTITLEMENT_PATH = "/licensing/entitlement/";
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
 }
 
+function randomUrlSafe(bytes = 32): string {
+  return randomBytes(bytes).toString("base64url");
+}
+
+function s256Challenge(verifier: string): string {
+  return createHash("sha256").update(verifier).digest("base64url");
+}
+
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
 // ──────────────────────────────────────────────────────────────────────
-// getUserFromRequest
+// Login: begin / complete
 // ──────────────────────────────────────────────────────────────────────
 
-function buildUser(
-  inner: InnerPayload,
-  expectedAppId: string,
-  clockSkew: number,
-): UtaUser {
-  for (const field of ["kind", "user_key", "app_id", "iat", "exp", "nonce"] as const) {
-    if (!(field in inner)) {
-      throw new UtaError(`decrypted payload missing field: ${field}`);
-    }
-  }
+export interface BeginLoginOptions {
+  scopes?: string;
+  redirectUri?: string;
+  prompt?: string;
+  extraParams?: Record<string, string>;
+}
 
-  if (inner.kind !== "launch") {
-    throw new UtaError(`unexpected payload kind: ${JSON.stringify(inner.kind)}`);
-  }
+/**
+ * Start an OIDC authorization-code (PKCE) login. Persist `flowState` in the
+ * user's session, then redirect the browser to `authorizationUrl`. Pass the
+ * same `flowState` back to {@link completeLogin} in your callback.
+ */
+export async function beginLogin(
+  opts: BeginLoginOptions = {},
+): Promise<{ authorizationUrl: string; flowState: UtaFlowState }> {
+  const cfg = loadConfig();
+  const meta = await getMetadata(cfg);
 
-  if (typeof inner.app_id !== "string" || inner.app_id !== expectedAppId) {
-    throw new UtaAppMismatchError(
-      "payload app_id does not match configured UTA_APP_ID",
-    );
-  }
+  const codeVerifier = randomUrlSafe();
+  const state = randomUrlSafe();
+  const nonce = randomUrlSafe();
+  const redirectUri = opts.redirectUri ?? cfg.redirect_uri;
 
-  if (
-    typeof inner.iat !== "number" ||
-    typeof inner.exp !== "number" ||
-    !Number.isFinite(inner.iat) ||
-    !Number.isFinite(inner.exp)
-  ) {
-    throw new UtaError("payload iat/exp are not integers");
-  }
-  const iat = Math.trunc(inner.iat);
-  const exp = Math.trunc(inner.exp);
-
-  if (nowSeconds() > exp + clockSkew) {
-    throw new UtaPayloadExpiredError("launch payload has expired");
-  }
-
-  if (typeof inner.user_key !== "string" || inner.user_key === "") {
-    throw new UtaError("payload user_key must be a non-empty string");
-  }
-
-  const versionHint = inner.version_hint;
-  if (versionHint !== undefined && versionHint !== null && typeof versionHint !== "string") {
-    throw new UtaError("payload version_hint must be a string when present");
-  }
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: cfg.client_id,
+    redirect_uri: redirectUri,
+    scope: opts.scopes ?? cfg.scopes,
+    state,
+    nonce,
+    code_challenge: s256Challenge(codeVerifier),
+    code_challenge_method: "S256",
+  });
+  if (opts.prompt) params.set("prompt", opts.prompt);
+  for (const [k, v] of Object.entries(opts.extraParams ?? {})) params.set(k, v);
 
   return {
-    user_key: inner.user_key,
-    app_id: inner.app_id,
-    issued_at: iat,
-    expires_at: exp,
-    version_hint: typeof versionHint === "string" ? versionHint : null,
+    authorizationUrl: meta.authorization_endpoint + "?" + params.toString(),
+    flowState: { state, nonce, codeVerifier, redirectUri },
   };
 }
 
-/** Verify + decrypt a raw launch envelope (string or already-parsed object). */
-export function getUser(
-  payload: string | Record<string, unknown>,
-): UtaUser {
-  const cfg = loadConfig();
-  const inner = unpackPayload(payload, {
-    developerPrivateKey: cfg.private_key,
-    marketPublicKey: cfg.market_public_key,
-  });
-  return buildUser(inner, cfg.app_id, cfg.clock_skew_seconds);
-}
-
-/** Minimal shape of an Express/Connect-style request. */
-export interface UtaRequestLike {
-  body?: unknown;
-}
-
-function extractPayloadFromRequest(req: UtaRequestLike): string | Record<string, unknown> {
-  const body = req?.body;
-  if (body == null || typeof body !== "object") {
-    throw new UtaError("could not find 'uta_payload' in request body");
-  }
-  const val = (body as Record<string, unknown>).uta_payload;
-  if (val == null) {
-    throw new UtaError("could not find 'uta_payload' in request body");
-  }
-  if (typeof val !== "string" && (typeof val !== "object" || Array.isArray(val))) {
-    throw new UtaError("'uta_payload' must be a string or object");
-  }
-  return val as string | Record<string, unknown>;
+export interface CompleteLoginArgs {
+  code: string | null | undefined;
+  state: string | null | undefined;
+  flowState: UtaFlowState;
 }
 
 /**
- * Verify the launch envelope on an Express/Connect-style inbound request.
- * Expects body-parser middleware to have populated `req.body` already.
+ * Finish login: validate `state`, exchange `code`, verify the ID token
+ * (signature via JWKS, `iss`/`aud`/`exp`/`nonce`). Returns a session whose
+ * `sub` is the user's stable per-app id.
  */
-export function getUserFromRequest(req: UtaRequestLike): UtaUser {
-  const payload = extractPayloadFromRequest(req);
-  return getUser(payload);
+export async function completeLogin(args: CompleteLoginArgs): Promise<UtaSession> {
+  const cfg = loadConfig();
+  const { code, state, flowState } = args;
+  if (!code) throw new UtaAuthError("missing authorization code");
+  if (!flowState?.state || !timingSafeEqualStr(String(state ?? ""), flowState.state)) {
+    throw new UtaAuthError("state mismatch — possible CSRF or a stale login");
+  }
+
+  const meta = await getMetadata(cfg);
+  const token = await tokenRequest(cfg, meta, {
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: flowState.redirectUri ?? cfg.redirect_uri,
+    code_verifier: flowState.codeVerifier,
+  });
+
+  const idToken = token.id_token;
+  if (typeof idToken !== "string") {
+    throw new UtaTokenError("token response did not include an id_token");
+  }
+  const claims = await validateIdToken(cfg, meta, idToken, flowState.nonce);
+  return sessionFromToken(token, String(claims.sub), claims, idToken);
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// getVersion
+// Refresh / userinfo / logout
 // ──────────────────────────────────────────────────────────────────────
 
-interface GetVersionBody extends Record<string, unknown> {
-  app_id: string;
-  user_key: string;
-  ts: number;
-  nonce: string;
-  signature?: string;
-}
-
 /**
- * Build a canonical JSON string matching Python's
- * `json.dumps(obj, sort_keys=True, separators=(",", ":"))` — sorted keys,
- * compact separators, UTF-8. Only flat objects with string/number values
- * are signed here, so a shallow sort is sufficient.
+ * Exchange a refresh token for a fresh session. usethatapp.com rotates
+ * refresh tokens, so use the returned `refresh_token` next time. If the
+ * provider omits an ID token, `sub` is resolved via the userinfo endpoint.
  */
-function canonicalize(obj: Record<string, unknown>): string {
-  const keys = Object.keys(obj).sort();
-  return JSON.stringify(obj, keys);
-}
-
-function buildGetVersionBody(cfg: UtaConfig, userKey: string): GetVersionBody {
-  const body: GetVersionBody = {
-    app_id: cfg.app_id,
-    user_key: userKey,
-    ts: nowSeconds(),
-    nonce: randomBytes(16).toString("hex"),
-  };
-  const canonical = Buffer.from(canonicalize(body), "utf8");
-  const signature = sign("sha256", canonical, {
-    key: cfg.private_key,
-    padding: constants.RSA_PKCS1_PSS_PADDING,
-    saltLength: constants.RSA_PSS_SALTLEN_MAX_SIGN,
-  });
-  body.signature = signature.toString("hex");
-  return body;
-}
-
-function cacheGet(userKey: string): CacheEntry | null {
-  const entry = versionCache.get(userKey);
-  if (entry === undefined) return null;
-  if (nowSeconds() >= entry.expires_at) {
-    versionCache.delete(userKey);
-    return null;
-  }
-  return entry;
-}
-
-function cachePut(userKey: string, version: string | null, cacheUntil: number): void {
-  versionCache.set(userKey, { version, expires_at: cacheUntil });
-}
-
-/** Drop all entries from the process-local version cache. */
-export function clearVersionCache(): void {
-  versionCache.clear();
-}
-
-function handleResponseStatus(status: number, bodyText: string): void {
-  if (status >= 200 && status < 300) return;
-  if (status === 400) {
-    throw new UtaBadRequestError(`400 from getversion: ${bodyText}`);
-  }
-  if (status === 401) {
-    throw new UtaSignatureError(`401 from getversion: ${bodyText}`);
-  }
-  if (status === 403) {
-    throw new UtaSessionRevokedError(`403 from getversion: ${bodyText}`);
-  }
-  if (status === 404) {
-    throw new UtaUnknownSessionError(`404 from getversion: ${bodyText}`);
-  }
-  if (status >= 500 && status < 600) {
-    throw new UtaServerError(`${status} from getversion: ${bodyText}`);
-  }
-  throw new UtaError(`unexpected status ${status} from getversion: ${bodyText}`);
-}
-
-function parseGetVersionResponse(data: unknown): { version: string | null; cacheUntil: number } {
-  if (data === null || typeof data !== "object" || Array.isArray(data)) {
-    throw new UtaError("getversion response is not a JSON object");
-  }
-  const obj = data as Record<string, unknown>;
-  if (!("version" in obj)) {
-    throw new UtaError("getversion response missing 'version'");
-  }
-  const version = obj.version;
-  if (version !== null && typeof version !== "string") {
-    throw new UtaError("getversion response 'version' must be string or null");
-  }
-
-  let cacheUntil: number;
-  const rawCacheUntil = obj.cache_until;
-  if (typeof rawCacheUntil === "number" && Number.isFinite(rawCacheUntil)) {
-    cacheUntil = Math.trunc(rawCacheUntil);
-  } else {
-    const rawCacheSeconds = obj.cache_seconds;
-    if (typeof rawCacheSeconds === "number" && Number.isFinite(rawCacheSeconds)) {
-      cacheUntil = nowSeconds() + Math.trunc(rawCacheSeconds);
-    } else {
-      cacheUntil = nowSeconds(); // don't cache
-    }
-  }
-  return { version, cacheUntil };
-}
-
-export interface GetVersionOptions {
-  /** When false, bypass the process-local TTL cache (default: true). */
-  useCache?: boolean;
-}
-
-/**
- * Fetch the current license tier for `userKey` from the marketplace.
- *
- * Returns the product/version name as a string, or `null` if the user
- * has no active license.
- *
- * Throws `UtaBadRequestError`, `UtaSignatureError`, `UtaSessionRevokedError`,
- * `UtaUnknownSessionError`, `UtaServerError`, or `UtaError` on transport
- * or schema failures.
- */
-export async function getVersion(
-  userKey: string,
-  opts: GetVersionOptions = {},
-): Promise<string | null> {
-  if (typeof userKey !== "string" || userKey === "") {
-    throw new UtaError("userKey must be a non-empty string");
-  }
-  const useCache = opts.useCache !== false;
-
+export async function refresh(refreshToken: string): Promise<UtaSession> {
   const cfg = loadConfig();
+  if (!refreshToken) throw new UtaTokenError("refresh_token is required");
+  const meta = await getMetadata(cfg);
+  const token = await tokenRequest(cfg, meta, {
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    scope: cfg.scopes,
+  });
+  // Carry the old refresh token forward if rotation didn't return a new one.
+  if (typeof token.refresh_token !== "string") token.refresh_token = refreshToken;
 
-  if (useCache) {
-    const cached = cacheGet(userKey);
-    if (cached !== null) {
-      return cached.version;
-    }
+  const idToken = token.id_token;
+  if (typeof idToken === "string") {
+    const claims = await validateIdToken(cfg, meta, idToken, null);
+    return sessionFromToken(token, String(claims.sub), claims, idToken);
   }
+  const info = await userinfo(String(token.access_token));
+  return sessionFromToken(token, String(info.sub ?? ""), info, null);
+}
 
-  const body = buildGetVersionBody(cfg, userKey);
-  const url = cfg.api_url + GETVERSION_PATH;
-
-  const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    cfg.request_timeout_seconds * 1000,
-  );
-
-  let response: Response;
+/** Fetch the OIDC userinfo claims (`sub` only — no PII). */
+export async function userinfo(accessToken: string): Promise<Record<string, unknown>> {
+  const cfg = loadConfig();
+  const meta = await getMetadata(cfg);
+  if (!meta.userinfo_endpoint) throw new UtaError("provider has no userinfo_endpoint");
+  let resp: Response;
   try {
-    response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-      redirect: "follow",
-    });
+    resp = await fetchWithTimeout(
+      meta.userinfo_endpoint,
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+      cfg.request_timeout_seconds,
+    );
   } catch (e) {
-    const err = e instanceof Error ? e.message : String(e);
-    throw new UtaServerError(`network error calling getversion: ${err}`);
-  } finally {
-    clearTimeout(timer);
+    throw new UtaServerError(`network error calling userinfo: ${errMessage(e)}`);
   }
+  if (resp.status === 401) throw new UtaTokenError(`401 from userinfo: ${await resp.text()}`);
+  if (resp.status >= 500) throw new UtaServerError(`${resp.status} from userinfo`);
+  try {
+    return (await resp.json()) as Record<string, unknown>;
+  } catch (e) {
+    throw new UtaError(`userinfo response is not valid JSON: ${errMessage(e)}`);
+  }
+}
 
-  const bodyText = await response.text();
-  handleResponseStatus(response.status, bodyText);
+export interface LogoutUrlOptions {
+  idToken?: string | null;
+  postLogoutRedirectUri?: string;
+  state?: string;
+}
 
+/** Build the RP-initiated end-session (logout) URL to redirect to. */
+export async function logoutUrl(opts: LogoutUrlOptions = {}): Promise<string> {
+  const cfg = loadConfig();
+  const meta = await getMetadata(cfg);
+  const endpoint = meta.end_session_endpoint;
+  if (!endpoint) throw new UtaError("provider has no end_session_endpoint");
+  const params = new URLSearchParams();
+  if (opts.idToken) params.set("id_token_hint", opts.idToken);
+  if (opts.postLogoutRedirectUri) {
+    params.set("post_logout_redirect_uri", opts.postLogoutRedirectUri);
+    params.set("client_id", cfg.client_id);
+  }
+  if (opts.state) params.set("state", opts.state);
+  const qs = params.toString();
+  if (!qs) return endpoint;
+  return `${endpoint}${endpoint.includes("?") ? "&" : "?"}${qs}`;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Entitlement (the OAuth-era replacement for getVersion)
+// ──────────────────────────────────────────────────────────────────────
+
+export interface GetEntitlementOptions {
+  /** Override the per-request timeout (seconds). */
+  timeoutSeconds?: number;
+}
+
+/**
+ * Query the user's live license state for your app. Sends
+ * `Authorization: Bearer <accessToken>` to `/licensing/entitlement/`.
+ * Always authoritative — a canceled license stops being entitled
+ * immediately, regardless of token lifetime.
+ */
+export async function getEntitlement(
+  accessToken: string,
+  opts: GetEntitlementOptions = {},
+): Promise<Entitlement> {
+  const cfg = loadConfig();
+  if (!accessToken) throw new UtaTokenError("accessToken must be a non-empty string");
+  const url = cfg.api_url + ENTITLEMENT_PATH;
+  let resp: Response;
+  try {
+    resp = await fetchWithTimeout(
+      url,
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+      opts.timeoutSeconds ?? cfg.request_timeout_seconds,
+    );
+  } catch (e) {
+    throw new UtaServerError(`network error calling entitlement: ${errMessage(e)}`);
+  }
+  const text = await resp.text();
+  raiseForEntitlementStatus(resp.status, text);
   let data: unknown;
   try {
-    data = JSON.parse(bodyText);
+    data = JSON.parse(text);
   } catch (e) {
-    const err = e instanceof Error ? e.message : String(e);
-    throw new UtaError(`getversion response is not valid JSON: ${err}`);
+    throw new UtaError(`entitlement response is not valid JSON: ${errMessage(e)}`);
+  }
+  return parseEntitlement(data);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Internals
+// ──────────────────────────────────────────────────────────────────────
+
+async function tokenRequest(
+  cfg: UtaConfig,
+  meta: OidcMetadata,
+  data: Record<string, string>,
+): Promise<Record<string, unknown>> {
+  const body = new URLSearchParams(data);
+  const headers: Record<string, string> = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    Accept: "application/json",
+  };
+  // Confidential clients use HTTP Basic (client_secret_basic); public
+  // clients send client_id in the body and rely on PKCE.
+  if (cfg.client_secret) {
+    headers.Authorization =
+      "Basic " + Buffer.from(`${cfg.client_id}:${cfg.client_secret}`).toString("base64");
+  } else {
+    body.set("client_id", cfg.client_id);
   }
 
-  const { version, cacheUntil } = parseGetVersionResponse(data);
-  if (useCache && cacheUntil > nowSeconds()) {
-    cachePut(userKey, version, cacheUntil);
+  let resp: Response;
+  try {
+    resp = await fetchWithTimeout(
+      meta.token_endpoint,
+      { method: "POST", headers, body: body.toString() },
+      cfg.request_timeout_seconds,
+    );
+  } catch (e) {
+    throw new UtaServerError(`network error calling token endpoint: ${errMessage(e)}`);
   }
-  return version;
+  const text = await resp.text();
+  if (resp.status >= 500) {
+    throw new UtaServerError(`${resp.status} from token endpoint: ${text}`);
+  }
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    throw new UtaTokenError(
+      `token endpoint returned non-JSON (${resp.status}): ${text.slice(0, 200)}`,
+    );
+  }
+  if (resp.status !== 200 || "error" in payload) {
+    const err = (payload.error as string) ?? `http_${resp.status}`;
+    const desc = (payload.error_description as string) ?? "";
+    throw new UtaTokenError(`token endpoint error: ${err} ${desc}`.trim());
+  }
+  if (typeof payload.access_token !== "string") {
+    throw new UtaTokenError("token response missing access_token");
+  }
+  return payload;
+}
+
+async function validateIdToken(
+  cfg: UtaConfig,
+  meta: OidcMetadata,
+  idToken: string,
+  nonce: string | null,
+): Promise<Record<string, unknown>> {
+  let payload: Record<string, unknown>;
+  try {
+    const result = await jwtVerify(idToken, getJwks(meta), {
+      issuer: meta.issuer,
+      audience: cfg.client_id,
+      clockTolerance: cfg.clock_skew_seconds,
+      algorithms: ["RS256"],
+    });
+    payload = result.payload as Record<string, unknown>;
+  } catch (e) {
+    throw new UtaTokenError(`ID token validation failed: ${errMessage(e)}`);
+  }
+  if (typeof payload.sub !== "string" || !payload.sub) {
+    throw new UtaTokenError("ID token missing sub");
+  }
+  if (nonce != null && payload.nonce !== nonce) {
+    throw new UtaTokenError("ID token nonce mismatch");
+  }
+  return payload;
+}
+
+function sessionFromToken(
+  token: Record<string, unknown>,
+  sub: string,
+  claims: Record<string, unknown>,
+  idToken: string | null,
+): UtaSession {
+  const expiresIn = Number(token.expires_in ?? 0) || 0;
+  return {
+    sub,
+    access_token: String(token.access_token),
+    expires_at: nowSeconds() + expiresIn,
+    refresh_token: typeof token.refresh_token === "string" ? token.refresh_token : null,
+    id_token: idToken,
+    scope: typeof token.scope === "string" ? token.scope : "",
+    token_type: typeof token.token_type === "string" ? token.token_type : "Bearer",
+    claims,
+  };
+}
+
+function raiseForEntitlementStatus(status: number, bodyText: string): void {
+  if (status >= 200 && status < 300) return;
+  if (status === 400) {
+    throw new UtaError(`400 from entitlement (client not linked to an app?): ${bodyText}`);
+  }
+  if (status === 401) {
+    throw new UtaTokenError(`401 from entitlement — access token invalid/expired: ${bodyText}`);
+  }
+  if (status === 403) {
+    throw new UtaPermissionError(`403 from entitlement — missing 'entitlements' scope: ${bodyText}`);
+  }
+  if (status >= 500 && status < 600) {
+    throw new UtaServerError(`${status} from entitlement: ${bodyText}`);
+  }
+  throw new UtaError(`unexpected status ${status} from entitlement: ${bodyText}`);
+}
+
+function parseEntitlement(data: unknown): Entitlement {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    throw new UtaError("entitlement response is not a JSON object");
+  }
+  const obj = data as Record<string, unknown>;
+  return {
+    entitled: Boolean(obj.entitled),
+    version: typeof obj.version === "string" ? obj.version : null,
+    product_id: typeof obj.product_id === "string" ? obj.product_id : null,
+    status: typeof obj.status === "string" ? obj.status : "none",
+    is_free: Boolean(obj.is_free),
+    period_end: typeof obj.period_end === "string" ? obj.period_end : null,
+    raw: obj,
+  };
 }

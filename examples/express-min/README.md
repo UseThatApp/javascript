@@ -1,19 +1,18 @@
 # express-min
 
-Express launch endpoint using `utaLaunchView`.
+Express OIDC login / callback / logout using the framework-agnostic SDK.
+The SDK ships no Express-specific code — this wires the three bits yourself:
+read callback params (`req.query`), store `flowState` in `req.session`, redirect.
 
 ## Run
 
 ```bash
-npm install express
-export UTA_APP_ID=...
-export UTA_PRIVATE_KEY="$(cat my_private.pem)"
+npm install usethatapp express express-session
+export UTA_CLIENT_ID=... UTA_CLIENT_SECRET=...
+export UTA_REDIRECT_URI=http://localhost:3000/callback
 node examples/express-min/app.mjs
 ```
 
-`utaLaunchView`:
-
-- Restricts the route to `POST` (returns 405 otherwise).
-- Returns 400 with a short reason on any envelope failure.
-- Attaches the verified `UtaUser` to `req.utaUser` *and* passes it as
-  the second positional argument to your handler.
+Routes: `/login` starts the flow, `/callback` completes it, `/` shows the
+entitlement, `/logout` ends the session. Identity is `session.sub` — a
+pairwise pseudonymous id (no PII); key your user records off it.

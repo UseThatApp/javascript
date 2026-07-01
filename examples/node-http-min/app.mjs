@@ -1,44 +1,78 @@
-// Minimal launch endpoint built on Node's built-in http module — no
-// framework. Demonstrates the framework-agnostic API:
-// `getUser` + `getVersion`.
+// Minimal plain node:http app: UseThatApp OIDC login + entitlement (docs only).
+// No framework, no session library — a tiny in-memory cookie session shows the
+// three bits you wire yourself: read callback params, store flowState, redirect.
+//
+//   npm install usethatapp
+//   export UTA_CLIENT_ID=... UTA_CLIENT_SECRET=... UTA_REDIRECT_URI=http://localhost:3000/callback
+//   node app.mjs
 
 import { createServer } from "node:http";
+import { randomBytes } from "node:crypto";
 
-import { getUser, getVersion, UtaError } from "usethatapp";
+import { beginLogin, completeLogin, getEntitlement, logoutUrl, UtaError, UtaTokenError } from "usethatapp";
 
-async function readBody(req) {
-  let chunks = "";
-  for await (const chunk of req) chunks += chunk;
-  return chunks;
-}
+// Toy server-side session store keyed by a cookie. Use a real session in prod.
+const sessions = new Map();
 
-function extractPayload(contentType, body) {
-  if (contentType.includes("application/json")) {
-    return JSON.parse(body).uta_payload;
-  }
-  // default: application/x-www-form-urlencoded (what the marketplace posts)
-  return Object.fromEntries(new URLSearchParams(body)).uta_payload;
+function getSession(req, res) {
+  const sid = (req.headers.cookie ?? "").match(/sid=([^;]+)/)?.[1];
+  if (sid && sessions.has(sid)) return sessions.get(sid);
+  const id = randomBytes(16).toString("hex");
+  const data = {};
+  sessions.set(id, data);
+  res.setHeader("Set-Cookie", `sid=${id}; HttpOnly; Path=/`);
+  return data;
 }
 
 export function createApp() {
   return createServer(async (req, res) => {
-    if (req.method !== "POST" || req.url !== "/launch") {
-      res.statusCode = 404;
-      res.end();
-      return;
-    }
+    const url = new URL(req.url, "http://localhost");
+    const sess = getSession(req, res);
     try {
-      const body = await readBody(req);
-      const payload = extractPayload(req.headers["content-type"] ?? "", body);
-      const user = getUser(payload);
-      const version = await getVersion(user.user_key);
-      res.statusCode = 200;
-      res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ user_key: user.user_key, version }));
+      if (url.pathname === "/login") {
+        const { authorizationUrl, flowState } = await beginLogin();
+        sess.utaFlow = flowState;
+        res.writeHead(302, { Location: authorizationUrl }).end();
+      } else if (url.pathname === "/callback") {
+        // On cancel/deny, OAuth redirects back with ?error=... and no code.
+        if (url.searchParams.get("error")) {
+          delete sess.utaFlow;
+          res.writeHead(302, { Location: "/" }).end();
+          return;
+        }
+        const s = await completeLogin({
+          code: url.searchParams.get("code"),
+          state: url.searchParams.get("state"),
+          flowState: sess.utaFlow,
+        });
+        delete sess.utaFlow;
+        sess.utaSub = s.sub;
+        sess.utaAccessToken = s.access_token;
+        sess.utaIdToken = s.id_token;
+        res.writeHead(302, { Location: "/" }).end();
+      } else if (url.pathname === "/logout") {
+        // Don't clear the session yet — the user may choose "Stay signed in". A
+        // real logout revokes the token, so the next getEntitlement (home) 401s
+        // and we drop it then.
+        const idToken = sess.utaIdToken;
+        res.writeHead(302, { Location: await logoutUrl({ idToken }) }).end();
+      } else {
+        if (sess.utaAccessToken) {
+          try {
+            const ent = await getEntitlement(sess.utaAccessToken);
+            res.setHeader("Content-Type", "application/json");
+            res.end(JSON.stringify({ sub: sess.utaSub, entitlement: ent.raw }));
+            return;
+          } catch (e) {
+            if (!(e instanceof UtaTokenError)) throw e;
+            // Token revoked/expired (signed out of UseThatApp). Reconcile.
+            delete sess.utaAccessToken; delete sess.utaSub; delete sess.utaIdToken;
+          }
+        }
+        res.end('<a href="/login">Log in with UseThatApp</a>');
+      }
     } catch (e) {
-      const status = e instanceof UtaError ? 400 : 500;
-      res.statusCode = status;
-      res.end(String(e?.message ?? e));
+      res.writeHead(e instanceof UtaError ? 400 : 500).end(`error: ${e.message}`);
     }
   });
 }
