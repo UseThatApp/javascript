@@ -63,8 +63,13 @@ import {
   refresh,         // (refreshToken) => UtaSession
   userinfo,        // (accessToken) => { sub }
   logoutUrl,       // ({ idToken, postLogoutRedirectUri }) => string
+  purchaseUrl,     // (priceId, { next, ref, email }) => string
+  manageUrl,       // ({ next }) => string
+  getAppInfo,      // () => AppInfo
+  getPrices,       // () => AppPrices
   configure, resetConfig,
   type UtaSession, type Entitlement, type UtaFlowState,
+  type AppInfo, type AppPrices, type UtaPrice,
   // errors:
   UtaError, UtaConfigError, UtaDiscoveryError, UtaAuthError,
   UtaTokenError, UtaPermissionError, UtaServerError,
@@ -113,6 +118,58 @@ nothing framework-specific ships in the package.
 
 All inherit from `UtaError` — catch that for a single `catch` clause.
 
+## Purchase links & pricing
+
+usethatapp.com can sell your app directly from your own website: hosted
+checkout links, a buyer management page, and a public pricing API. The SDK
+wraps these thinly — `purchaseUrl`/`manageUrl` are pure URL builders (no
+network), and the pricing API needs **no auth** at all.
+
+The natural upgrade CTA: when an entitlement comes back not entitled, send
+the user to a purchase link.
+
+```js
+import { getEntitlement, purchaseUrl, manageUrl } from "usethatapp";
+
+const ent = await getEntitlement(accessToken);
+if (!ent.entitled) {
+  // Hosted checkout for a specific price (id from getPrices()):
+  return res.redirect(purchaseUrl("prc_...", { next: "https://yourapp.example/welcome" }));
+}
+// Existing buyers manage/cancel their subscription here:
+const billingLink = manageUrl({ next: "https://yourapp.example/settings" });
+```
+
+`purchaseUrl` options: `next` must be an HTTPS URL on your app's registered
+domain (validated server-side — invalid values show the buyer a
+"misconfigured link" page; omit it to land on your registered Login URL),
+`ref` credits an affiliate code, and `email` prefills the buyer's email.
+
+Render pricing from `getPrices()` instead of hardcoding amounts — server-side,
+for example:
+
+```js
+import { getPrices } from "usethatapp";
+
+const { app_name, has_free_tier, prices } = await getPrices();
+const rows = prices.map((p) => {
+  const cadence = p.is_recurring ? `/${p.frequency}` : " one-time";
+  // p.amount is a decimal string like "10.00" — format, don't parseFloat.
+  return `<tr><td>${p.product_name}</td>` +
+    `<td>${p.amount} ${p.currency.toUpperCase()}${cadence}</td>` +
+    `<td><a href="${p.buy_url}">Buy</a></td></tr>`;
+});
+```
+
+Each price's `product_id` matches `Entitlement.product_id`, so a purchase
+option maps directly onto your gating logic, and each `buy_url` is the
+ready-made hosted checkout link (equivalent to `purchaseUrl(p.public_id)`).
+
+Notes: the pricing API is anonymous and CORS-enabled; UseThatApp is the
+merchant of record; purchases are currently **US-only**; and buy links 404
+until external sales is enabled for your app (currently in beta). Details at
+[docs.usethatapp.com](https://docs.usethatapp.com).
+
 ## Signing out
 
 Sign-out is RP-initiated: redirect the user to `logoutUrl({ idToken })`. Both
@@ -149,6 +206,25 @@ npm test        # build + node:test suite
 ```
 
 ## Changelog
+
+### 2.1.0 (2026-07-30)
+
+Purely additive — nothing existing changed. Thin support for selling your
+app from your own website (hosted purchase links, buyer management page,
+public pricing API).
+
+**Added**
+
+- `purchaseUrl(priceId, { next, ref, email })` — pure builder for the hosted
+  checkout URL of a price.
+- `manageUrl({ next })` — pure builder for the buyer's subscription-management
+  page URL for your app.
+- `getAppInfo()` → `AppInfo` — the app's public listing info (anonymous, no
+  auth).
+- `getPrices()` → `AppPrices` — the app's public price list (anonymous, no
+  auth); each `UtaPrice` carries a ready-made `buy_url` and a `product_id`
+  matching the entitlement endpoint's.
+- New types: `AppInfo`, `AppPrices`, `UtaPrice`.
 
 ### 2.0.0
 

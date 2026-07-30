@@ -25,9 +25,10 @@ import {
   UtaTokenError,
 } from "./errors.js";
 import { errMessage, fetchWithTimeout } from "./http.js";
-import type { Entitlement, UtaFlowState, UtaSession } from "./types.js";
+import type { AppInfo, AppPrices, Entitlement, UtaFlowState, UtaPrice, UtaSession } from "./types.js";
 
 const ENTITLEMENT_PATH = "/licensing/entitlement/";
+const PUBLIC_APPS_PATH = "/api/v1/public/apps/";
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
@@ -251,6 +252,96 @@ export async function getEntitlement(
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Purchase links & public pricing (selling from your own website)
+// ──────────────────────────────────────────────────────────────────────
+
+export interface PurchaseUrlOptions {
+  /** Where the buyer lands after purchase. Must be an HTTPS URL on your
+   * app's registered domain — validated server-side; invalid values show
+   * the buyer a "misconfigured link" page. Defaults to your app's
+   * registered Login URL. */
+  next?: string;
+  /** Affiliate code to credit for the sale. */
+  ref?: string;
+  /** Prefills the buyer's email on the checkout page. */
+  email?: string;
+}
+
+/**
+ * Build the hosted purchase (checkout) URL for one of your app's prices.
+ * Pure URL builder — no network. `priceId` is the opaque public price
+ * identifier (`prc_…`) from {@link getPrices} — or just use each price's
+ * ready-made `buy_url` directly.
+ *
+ * Uses config only for the API URL. Being pure, the logic is trivially
+ * copyable into browser code even though this package is Node-only.
+ */
+export function purchaseUrl(priceId: string, opts: PurchaseUrlOptions = {}): string {
+  const cfg = loadConfig();
+  if (!priceId || !priceId.trim()) {
+    throw new UtaError("priceId must be a non-empty string");
+  }
+  const params = new URLSearchParams();
+  if (opts.next) params.set("next", opts.next);
+  if (opts.ref) params.set("ref", opts.ref);
+  if (opts.email) params.set("email", opts.email);
+  const url = `${cfg.api_url}/buy/${encodeURIComponent(priceId)}/`;
+  const qs = params.toString();
+  return qs ? `${url}?${qs}` : url;
+}
+
+export interface ManageUrlOptions {
+  /** Becomes the "Back to app" link on the management page. */
+  next?: string;
+}
+
+/**
+ * Build the URL of the buyer's subscription-management page scoped to this
+ * app. Pure URL builder — no network. Requires `UTA_CLIENT_ID`.
+ */
+export function manageUrl(opts: ManageUrlOptions = {}): string {
+  const cfg = loadConfig();
+  const url = `${cfg.api_url}/manage/${encodeURIComponent(cfg.client_id)}/`;
+  if (!opts.next) return url;
+  return `${url}?${new URLSearchParams({ next: opts.next }).toString()}`;
+}
+
+export interface GetAppInfoOptions {
+  /** Override the per-request timeout (seconds). */
+  timeoutSeconds?: number;
+}
+
+/**
+ * Fetch your app's public listing info (name, tagline, listing mode, URLs).
+ * Anonymous — no Authorization header is sent, so no login is needed.
+ */
+export async function getAppInfo(opts: GetAppInfoOptions = {}): Promise<AppInfo> {
+  const cfg = loadConfig();
+  const url = cfg.api_url + PUBLIC_APPS_PATH + encodeURIComponent(cfg.client_id) + "/";
+  const data = await publicApiGet(url, "app info", opts.timeoutSeconds ?? cfg.request_timeout_seconds);
+  return parseAppInfo(data);
+}
+
+export interface GetPricesOptions {
+  /** Override the per-request timeout (seconds). */
+  timeoutSeconds?: number;
+}
+
+/**
+ * Fetch your app's public price list. Anonymous — no Authorization header
+ * is sent, so no login is needed. Render your pricing from this API instead
+ * of hardcoding amounts: each price's `product_id` matches the entitlement
+ * endpoint's `product_id` for gating, and each `buy_url` is the ready-made
+ * hosted checkout link.
+ */
+export async function getPrices(opts: GetPricesOptions = {}): Promise<AppPrices> {
+  const cfg = loadConfig();
+  const url = cfg.api_url + PUBLIC_APPS_PATH + encodeURIComponent(cfg.client_id) + "/prices/";
+  const data = await publicApiGet(url, "prices", opts.timeoutSeconds ?? cfg.request_timeout_seconds);
+  return parsePrices(data);
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Internals
 // ──────────────────────────────────────────────────────────────────────
 
@@ -381,6 +472,87 @@ function parseEntitlement(data: unknown): Entitlement {
     status: typeof obj.status === "string" ? obj.status : "none",
     is_free: Boolean(obj.is_free),
     period_end: typeof obj.period_end === "string" ? obj.period_end : null,
+    raw: obj,
+  };
+}
+
+/** Anonymous GET against the public API; returns the decoded JSON object. */
+async function publicApiGet(
+  url: string,
+  what: string,
+  timeoutSeconds: number,
+): Promise<Record<string, unknown>> {
+  let resp: Response;
+  try {
+    resp = await fetchWithTimeout(url, {}, timeoutSeconds);
+  } catch (e) {
+    throw new UtaServerError(`network error calling ${what}: ${errMessage(e)}`);
+  }
+  const text = await resp.text();
+  raiseForPublicApiStatus(resp.status, what, text);
+  let data: unknown;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    throw new UtaError(`${what} response is not valid JSON: ${errMessage(e)}`);
+  }
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    throw new UtaError(`${what} response is not a JSON object`);
+  }
+  return data as Record<string, unknown>;
+}
+
+function raiseForPublicApiStatus(status: number, what: string, bodyText: string): void {
+  if (status >= 200 && status < 300) return;
+  if (status === 404) {
+    throw new UtaError(
+      `404 from ${what} — app unknown, unpublished, or external sales not enabled: ${bodyText}`,
+    );
+  }
+  if (status === 429) {
+    throw new UtaServerError(`429 from ${what} — rate limited, retry with backoff: ${bodyText}`);
+  }
+  if (status >= 500 && status < 600) {
+    throw new UtaServerError(`${status} from ${what}: ${bodyText}`);
+  }
+  throw new UtaError(`unexpected status ${status} from ${what}: ${bodyText}`);
+}
+
+function parseAppInfo(obj: Record<string, unknown>): AppInfo {
+  return {
+    client_id: typeof obj.client_id === "string" ? obj.client_id : "",
+    name: typeof obj.name === "string" ? obj.name : "",
+    tagline: typeof obj.tagline === "string" ? obj.tagline : "",
+    listing_mode: typeof obj.listing_mode === "string" ? obj.listing_mode : "",
+    url: typeof obj.url === "string" ? obj.url : "",
+    marketplace_url: typeof obj.marketplace_url === "string" ? obj.marketplace_url : "",
+    raw: obj,
+  };
+}
+
+function parsePrice(data: unknown): UtaPrice {
+  const obj =
+    data !== null && typeof data === "object" && !Array.isArray(data)
+      ? (data as Record<string, unknown>)
+      : {};
+  return {
+    public_id: typeof obj.public_id === "string" ? obj.public_id : "",
+    product_id: typeof obj.product_id === "string" ? obj.product_id : "",
+    product_name: typeof obj.product_name === "string" ? obj.product_name : "",
+    amount: typeof obj.amount === "string" ? obj.amount : "",
+    currency: typeof obj.currency === "string" ? obj.currency : "",
+    is_recurring: Boolean(obj.is_recurring),
+    frequency: typeof obj.frequency === "string" ? obj.frequency : null,
+    buy_url: typeof obj.buy_url === "string" ? obj.buy_url : "",
+  };
+}
+
+function parsePrices(obj: Record<string, unknown>): AppPrices {
+  return {
+    client_id: typeof obj.client_id === "string" ? obj.client_id : "",
+    app_name: typeof obj.app_name === "string" ? obj.app_name : "",
+    has_free_tier: Boolean(obj.has_free_tier),
+    prices: Array.isArray(obj.prices) ? obj.prices.map(parsePrice) : [],
     raw: obj,
   };
 }
