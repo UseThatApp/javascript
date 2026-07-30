@@ -62,6 +62,30 @@ test("purchaseUrl builds the bare buy URL", () => {
   assert.equal(purchaseUrl("prc_abc123"), `${API_URL}/buy/prc_abc123/`);
 });
 
+test("purchaseUrl needs no config at all (defaults to production)", () => {
+  // A pricing-only integration (e.g. a marketing page) sets no OIDC
+  // config; the builder must not demand UTA_REDIRECT_URI or UTA_CLIENT_ID.
+  resetConfig();
+  assert.equal(
+    purchaseUrl("prc_abc123"),
+    "https://www.usethatapp.com/buy/prc_abc123/",
+  );
+});
+
+test("getPrices works without OIDC config (client_id + defaults only)", async () => {
+  resetConfig();
+  configure({ client_id: CLIENT_ID, api_url: API_URL });
+  routes.prices = () =>
+    json(200, {
+      client_id: CLIENT_ID,
+      app_name: "App",
+      has_free_tier: false,
+      prices: [],
+    });
+  const prices = await getPrices();
+  assert.equal(prices.app_name, "App");
+});
+
 test("purchaseUrl appends next, ref, email in order", () => {
   const url = purchaseUrl("prc_abc123", {
     next: "https://app.test.example/thanks",

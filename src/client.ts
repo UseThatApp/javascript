@@ -15,7 +15,13 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 import { jwtVerify } from "jose";
 
-import { loadConfig, type UtaConfig } from "./config.js";
+import {
+  loadConfig,
+  resolveApiUrl,
+  resolveClientId,
+  resolveRequestTimeoutSeconds,
+  type UtaConfig,
+} from "./config.js";
 import { getJwks, getMetadata, type OidcMetadata } from "./discovery.js";
 import {
   UtaAuthError,
@@ -277,7 +283,6 @@ export interface PurchaseUrlOptions {
  * copyable into browser code even though this package is Node-only.
  */
 export function purchaseUrl(priceId: string, opts: PurchaseUrlOptions = {}): string {
-  const cfg = loadConfig();
   if (!priceId || !priceId.trim()) {
     throw new UtaError("priceId must be a non-empty string");
   }
@@ -285,7 +290,7 @@ export function purchaseUrl(priceId: string, opts: PurchaseUrlOptions = {}): str
   if (opts.next) params.set("next", opts.next);
   if (opts.ref) params.set("ref", opts.ref);
   if (opts.email) params.set("email", opts.email);
-  const url = `${cfg.api_url}/buy/${encodeURIComponent(priceId)}/`;
+  const url = `${resolveApiUrl()}/buy/${encodeURIComponent(priceId)}/`;
   const qs = params.toString();
   return qs ? `${url}?${qs}` : url;
 }
@@ -300,8 +305,7 @@ export interface ManageUrlOptions {
  * app. Pure URL builder — no network. Requires `UTA_CLIENT_ID`.
  */
 export function manageUrl(opts: ManageUrlOptions = {}): string {
-  const cfg = loadConfig();
-  const url = `${cfg.api_url}/manage/${encodeURIComponent(cfg.client_id)}/`;
+  const url = `${resolveApiUrl()}/manage/${encodeURIComponent(resolveClientId())}/`;
   if (!opts.next) return url;
   return `${url}?${new URLSearchParams({ next: opts.next }).toString()}`;
 }
@@ -316,9 +320,8 @@ export interface GetAppInfoOptions {
  * Anonymous — no Authorization header is sent, so no login is needed.
  */
 export async function getAppInfo(opts: GetAppInfoOptions = {}): Promise<AppInfo> {
-  const cfg = loadConfig();
-  const url = cfg.api_url + PUBLIC_APPS_PATH + encodeURIComponent(cfg.client_id) + "/";
-  const data = await publicApiGet(url, "app info", opts.timeoutSeconds ?? cfg.request_timeout_seconds);
+  const url = resolveApiUrl() + PUBLIC_APPS_PATH + encodeURIComponent(resolveClientId()) + "/";
+  const data = await publicApiGet(url, "app info", opts.timeoutSeconds ?? resolveRequestTimeoutSeconds());
   return parseAppInfo(data);
 }
 
@@ -335,9 +338,8 @@ export interface GetPricesOptions {
  * hosted checkout link.
  */
 export async function getPrices(opts: GetPricesOptions = {}): Promise<AppPrices> {
-  const cfg = loadConfig();
-  const url = cfg.api_url + PUBLIC_APPS_PATH + encodeURIComponent(cfg.client_id) + "/prices/";
-  const data = await publicApiGet(url, "prices", opts.timeoutSeconds ?? cfg.request_timeout_seconds);
+  const url = resolveApiUrl() + PUBLIC_APPS_PATH + encodeURIComponent(resolveClientId()) + "/prices/";
+  const data = await publicApiGet(url, "prices", opts.timeoutSeconds ?? resolveRequestTimeoutSeconds());
   return parsePrices(data);
 }
 

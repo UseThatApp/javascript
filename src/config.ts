@@ -102,6 +102,32 @@ export function resetConfig(): void {
   _overrides = {};
 }
 
+// ── Partial resolvers for the purchase/pricing surface ─────────────────
+// purchaseUrl/manageUrl/getAppInfo/getPrices need only a slice of the
+// config, and a pricing-only integration (e.g. a marketing page) has no
+// reason to configure OIDC settings like UTA_REDIRECT_URI. These read the
+// same overrides/env as loadConfig without demanding the full OIDC set —
+// matching the Python SDK's resolve_* helpers.
+
+/** The marketplace base URL (`UTA_API_URL`, default production). */
+export function resolveApiUrl(): string {
+  return (readStr("UTA_API_URL") ?? DEFAULT_API_URL).replace(/\/+$/, "");
+}
+
+/** The app's public OAuth client id (`UTA_CLIENT_ID`, required). */
+export function resolveClientId(): string {
+  const clientId = readStr("UTA_CLIENT_ID");
+  if (!clientId) {
+    throw new UtaConfigError("UTA_CLIENT_ID is required");
+  }
+  return clientId;
+}
+
+/** Per-request timeout in seconds (`UTA_REQUEST_TIMEOUT_SECONDS`, default 10). */
+export function resolveRequestTimeoutSeconds(): number {
+  return readInt("UTA_REQUEST_TIMEOUT_SECONDS", 10);
+}
+
 /** Resolve and cache SDK configuration. */
 export function loadConfig(force = false): UtaConfig {
   if (_cached !== null && !force) {
