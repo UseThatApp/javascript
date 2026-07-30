@@ -225,6 +225,10 @@ public pricing API).
   auth); each `UtaPrice` carries a ready-made `buy_url` and a `product_id`
   matching the entitlement endpoint's.
 - New types: `AppInfo`, `AppPrices`, `UtaPrice`.
+- `Entitlement.product_public_id` — the opaque public product identifier
+  (`prod_…`) matching `UtaPrice.product_id` from the pricing API. New
+  integrations should gate on it; `Entitlement.product_id` currently
+  carries a legacy UUID and will converge on the same `prod_…` value.
 
 ### 2.0.0
 

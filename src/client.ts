@@ -471,6 +471,8 @@ function parseEntitlement(data: unknown): Entitlement {
     entitled: Boolean(obj.entitled),
     version: typeof obj.version === "string" ? obj.version : null,
     product_id: typeof obj.product_id === "string" ? obj.product_id : null,
+    product_public_id:
+      typeof obj.product_public_id === "string" ? obj.product_public_id : null,
     status: typeof obj.status === "string" ? obj.status : "none",
     is_free: Boolean(obj.is_free),
     period_end: typeof obj.period_end === "string" ? obj.period_end : null,

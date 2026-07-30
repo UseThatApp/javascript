@@ -61,8 +61,10 @@ export interface AppInfo {
 export interface UtaPrice {
   /** Opaque public price id (`prc_…`). Pass to {@link purchaseUrl}. */
   readonly public_id: string;
-  /** Stable product UUID — matches {@link Entitlement.product_id}, so you
-   * can map a purchase option to your gating logic. */
+  /** Opaque product identifier (`prod_…`) — matches
+   * {@link Entitlement.product_public_id}, so you can map a purchase
+   * option to your gating logic (and `Entitlement.product_id` after the
+   * platform's identifier cutover). */
   readonly product_id: string;
   /** Product/plan display name. */
   readonly product_name: string;
@@ -103,8 +105,15 @@ export interface Entitlement {
   readonly entitled: boolean;
   /** Product/plan display name, or `null` when not entitled. */
   readonly version: string | null;
-  /** Stable product UUID — prefer this over `version` for gating logic. */
+  /** Stable product identifier — prefer this over `version` for gating
+   * logic. Currently a legacy UUID; after the platform's identifier
+   * cutover it carries the same opaque `prod_…` value as
+   * `product_public_id`. */
   readonly product_id: string | null;
+  /** Opaque public product identifier (`prod_…`) — matches
+   * {@link UtaPrice.product_id} from the pricing API. New integrations
+   * should gate on this field. */
+  readonly product_public_id: string | null;
   /** `active`/`trialing`/`one_time_active`/`free`/`none`/… */
   readonly status: string;
   /** True when the entitlement comes from the app's free tier. */
