@@ -333,9 +333,11 @@ export interface GetPricesOptions {
 /**
  * Fetch your app's public price list. Anonymous — no Authorization header
  * is sent, so no login is needed. Render your pricing from this API instead
- * of hardcoding amounts: each price's `product_id` matches the entitlement
- * endpoint's `product_id` for gating, and each `buy_url` is the ready-made
- * hosted checkout link.
+ * of hardcoding amounts. Each price's `product_id` is the opaque `prod_…`
+ * identifier to gate on — compare it against
+ * {@link Entitlement.product_public_id} (`Entitlement.product_id` still
+ * carries the legacy UUID until the platform's identifier cutover). Each
+ * `buy_url` is the ready-made hosted checkout link.
  */
 export async function getPrices(opts: GetPricesOptions = {}): Promise<AppPrices> {
   const url = resolveApiUrl() + PUBLIC_APPS_PATH + encodeURIComponent(resolveClientId()) + "/prices/";

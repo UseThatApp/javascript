@@ -161,8 +161,10 @@ const rows = prices.map((p) => {
 });
 ```
 
-Each price's `product_id` matches `Entitlement.product_id`, so a purchase
-option maps directly onto your gating logic, and each `buy_url` is the
+Each price's `product_id` is the opaque `prod_…` identifier to gate on —
+compare it against **`Entitlement.product_public_id`** (`Entitlement.product_id`
+still carries the legacy UUID until the platform's identifier cutover, after
+which both fields carry the same `prod_…` value). Each `buy_url` is the
 ready-made hosted checkout link (equivalent to `purchaseUrl(p.public_id)`).
 
 Notes: the pricing API is anonymous and CORS-enabled; UseThatApp is the
