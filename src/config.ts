@@ -57,11 +57,12 @@ function readStr(name: string): string | undefined {
  * Resolve a secret from `UTA_FOO` or by reading the file at `UTA_FOO_PATH`.
  * The `*_PATH` variant supports hosting providers that mount secret files
  * (Render Secret Files, Fly volumes, k8s secret volumes, …). The direct
- * value wins if both are set.
+ * value wins if both are set; an empty direct value counts as unset, so a
+ * blank env var can't shadow a mounted secret file.
  */
 function readSecretOrPath(directName: string, pathName: string): string | undefined {
   const direct = readStr(directName);
-  if (direct !== undefined) return direct;
+  if (direct) return direct;
   const path = readStr(pathName);
   if (path === undefined) return undefined;
   try {
@@ -72,19 +73,25 @@ function readSecretOrPath(directName: string, pathName: string): string | undefi
   }
 }
 
-function readInt(name: string, fallback: number): number {
+function readInt(name: string, fallback: number, min: number): number {
   const raw = readRaw(name);
   if (raw === undefined) return fallback;
-  if (typeof raw === "number" && Number.isFinite(raw)) return Math.trunc(raw);
-  if (typeof raw === "string") {
+  let n: number;
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    n = Math.trunc(raw);
+  } else if (typeof raw === "string") {
     const trimmed = raw.trim();
-    const n = parseInt(trimmed, 10);
+    n = parseInt(trimmed, 10);
     if (Number.isNaN(n) || String(n) !== trimmed) {
       throw new UtaConfigError(`${name} must be an integer`);
     }
-    return n;
+  } else {
+    throw new UtaConfigError(`${name} must be an integer`);
   }
-  throw new UtaConfigError(`${name} must be an integer`);
+  if (n < min) {
+    throw new UtaConfigError(`${name} must be an integer >= ${min}`);
+  }
+  return n;
 }
 
 /**
@@ -100,6 +107,32 @@ export function configure(overrides: UtaConfigOverrides): void {
 export function resetConfig(): void {
   _cached = null;
   _overrides = {};
+}
+
+// ── Partial resolvers for the purchase/pricing surface ─────────────────
+// purchaseUrl/manageUrl/getAppInfo/getPrices need only a slice of the
+// config, and a pricing-only integration (e.g. a marketing page) has no
+// reason to configure OIDC settings like UTA_REDIRECT_URI. These read the
+// same overrides/env as loadConfig without demanding the full OIDC set —
+// matching the Python SDK's resolve_* helpers.
+
+/** The marketplace base URL (`UTA_API_URL`, default production). */
+export function resolveApiUrl(): string {
+  return (readStr("UTA_API_URL") ?? DEFAULT_API_URL).replace(/\/+$/, "");
+}
+
+/** The app's public OAuth client id (`UTA_CLIENT_ID`, required). */
+export function resolveClientId(): string {
+  const clientId = readStr("UTA_CLIENT_ID");
+  if (!clientId) {
+    throw new UtaConfigError("UTA_CLIENT_ID is required");
+  }
+  return clientId;
+}
+
+/** Per-request timeout in seconds (`UTA_REQUEST_TIMEOUT_SECONDS`, default 10). */
+export function resolveRequestTimeoutSeconds(): number {
+  return readInt("UTA_REQUEST_TIMEOUT_SECONDS", 10, 1);
 }
 
 /** Resolve and cache SDK configuration. */
@@ -132,8 +165,8 @@ export function loadConfig(force = false): UtaConfig {
     api_url,
     scopes,
     client_secret,
-    request_timeout_seconds: readInt("UTA_REQUEST_TIMEOUT_SECONDS", 10),
-    clock_skew_seconds: readInt("UTA_CLOCK_SKEW_SECONDS", 60),
+    request_timeout_seconds: readInt("UTA_REQUEST_TIMEOUT_SECONDS", 10, 1),
+    clock_skew_seconds: readInt("UTA_CLOCK_SKEW_SECONDS", 60, 0),
   };
   return _cached;
 }

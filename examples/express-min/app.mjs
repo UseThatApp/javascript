@@ -9,7 +9,7 @@
 import express from "express";
 import session from "express-session";
 
-import { beginLogin, completeLogin, getEntitlement, logoutUrl, UtaError, UtaTokenError } from "usethatapp";
+import { beginLogin, completeLogin, getEntitlement, logoutUrl, UtaError, UtaServerError, UtaTokenError } from "usethatapp";
 
 export function createApp() {
   const app = express();
@@ -41,7 +41,9 @@ export function createApp() {
       req.session.utaIdToken = s.id_token;
       res.redirect("/");
     } catch (e) {
-      const code = e instanceof UtaError ? 400 : 500;
+      // UtaServerError = provider 5xx/network trouble (retriable upstream
+      // outage), not a bad request from the client.
+      const code = e instanceof UtaServerError ? 502 : e instanceof UtaError ? 400 : 500;
       res.status(code).send(`login failed: ${e.message}`);
     }
   });

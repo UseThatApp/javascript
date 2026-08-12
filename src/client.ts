@@ -15,7 +15,13 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 import { jwtVerify } from "jose";
 
-import { loadConfig, type UtaConfig } from "./config.js";
+import {
+  loadConfig,
+  resolveApiUrl,
+  resolveClientId,
+  resolveRequestTimeoutSeconds,
+  type UtaConfig,
+} from "./config.js";
 import { getJwks, getMetadata, type OidcMetadata } from "./discovery.js";
 import {
   UtaAuthError,
@@ -24,10 +30,11 @@ import {
   UtaServerError,
   UtaTokenError,
 } from "./errors.js";
-import { errMessage, fetchWithTimeout } from "./http.js";
-import type { Entitlement, UtaFlowState, UtaSession } from "./types.js";
+import { errMessage, fetchWithTimeout, type TimedResponse } from "./http.js";
+import type { AppInfo, AppPrices, Entitlement, UtaFlowState, UtaPrice, UtaSession } from "./types.js";
 
 const ENTITLEMENT_PATH = "/licensing/entitlement/";
+const PUBLIC_APPS_PATH = "/api/v1/public/apps/";
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
@@ -86,7 +93,14 @@ export async function beginLogin(
     code_challenge_method: "S256",
   });
   if (opts.prompt) params.set("prompt", opts.prompt);
-  for (const [k, v] of Object.entries(opts.extraParams ?? {})) params.set(k, v);
+  for (const [k, v] of Object.entries(opts.extraParams ?? {})) {
+    // Silently overwriting state/nonce/code_challenge/... would break the
+    // CSRF, replay, and PKCE protections recorded in flowState.
+    if (params.has(k)) {
+      throw new UtaError(`extraParams may not override reserved parameter '${k}'`);
+    }
+    params.set(k, v);
+  }
 
   return {
     authorizationUrl: meta.authorization_endpoint + "?" + params.toString(),
@@ -111,6 +125,13 @@ export async function completeLogin(args: CompleteLoginArgs): Promise<UtaSession
   if (!code) throw new UtaAuthError("missing authorization code");
   if (!flowState?.state || !timingSafeEqualStr(String(state ?? ""), flowState.state)) {
     throw new UtaAuthError("state mismatch — possible CSRF or a stale login");
+  }
+  // Fail loudly if the session layer dropped fields — a missing nonce would
+  // otherwise silently disable replay protection.
+  if (!flowState.nonce || !flowState.codeVerifier) {
+    throw new UtaAuthError(
+      "flowState is missing nonce/codeVerifier — was it stored and restored intact?",
+    );
   }
 
   const meta = await getMetadata(cfg);
@@ -156,7 +177,10 @@ export async function refresh(refreshToken: string): Promise<UtaSession> {
     return sessionFromToken(token, String(claims.sub), claims, idToken);
   }
   const info = await userinfo(String(token.access_token));
-  return sessionFromToken(token, String(info.sub ?? ""), info, null);
+  if (typeof info.sub !== "string" || !info.sub) {
+    throw new UtaTokenError("userinfo response missing sub");
+  }
+  return sessionFromToken(token, info.sub, info, null);
 }
 
 /** Fetch the OIDC userinfo claims (`sub` only — no PII). */
@@ -164,7 +188,7 @@ export async function userinfo(accessToken: string): Promise<Record<string, unkn
   const cfg = loadConfig();
   const meta = await getMetadata(cfg);
   if (!meta.userinfo_endpoint) throw new UtaError("provider has no userinfo_endpoint");
-  let resp: Response;
+  let resp: TimedResponse;
   try {
     resp = await fetchWithTimeout(
       meta.userinfo_endpoint,
@@ -174,10 +198,12 @@ export async function userinfo(accessToken: string): Promise<Record<string, unkn
   } catch (e) {
     throw new UtaServerError(`network error calling userinfo: ${errMessage(e)}`);
   }
-  if (resp.status === 401) throw new UtaTokenError(`401 from userinfo: ${await resp.text()}`);
+  if (resp.status === 401) throw new UtaTokenError(`401 from userinfo: ${resp.text}`);
+  if (resp.status === 403) throw new UtaPermissionError(`403 from userinfo: ${resp.text}`);
   if (resp.status >= 500) throw new UtaServerError(`${resp.status} from userinfo`);
+  if (!resp.ok) throw new UtaError(`unexpected status ${resp.status} from userinfo: ${resp.text}`);
   try {
-    return (await resp.json()) as Record<string, unknown>;
+    return JSON.parse(resp.text) as Record<string, unknown>;
   } catch (e) {
     throw new UtaError(`userinfo response is not valid JSON: ${errMessage(e)}`);
   }
@@ -228,26 +254,102 @@ export async function getEntitlement(
 ): Promise<Entitlement> {
   const cfg = loadConfig();
   if (!accessToken) throw new UtaTokenError("accessToken must be a non-empty string");
-  const url = cfg.api_url + ENTITLEMENT_PATH;
-  let resp: Response;
-  try {
-    resp = await fetchWithTimeout(
-      url,
-      { headers: { Authorization: `Bearer ${accessToken}` } },
-      opts.timeoutSeconds ?? cfg.request_timeout_seconds,
-    );
-  } catch (e) {
-    throw new UtaServerError(`network error calling entitlement: ${errMessage(e)}`);
-  }
-  const text = await resp.text();
-  raiseForEntitlementStatus(resp.status, text);
-  let data: unknown;
-  try {
-    data = JSON.parse(text);
-  } catch (e) {
-    throw new UtaError(`entitlement response is not valid JSON: ${errMessage(e)}`);
-  }
+  const data = await apiGetJson(
+    cfg.api_url + ENTITLEMENT_PATH,
+    "entitlement",
+    opts.timeoutSeconds ?? cfg.request_timeout_seconds,
+    { Authorization: `Bearer ${accessToken}` },
+    raiseForEntitlementStatus,
+  );
   return parseEntitlement(data);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Purchase links & public pricing (selling from your own website)
+// ──────────────────────────────────────────────────────────────────────
+
+export interface PurchaseUrlOptions {
+  /** Where the buyer lands after purchase. Must be an HTTPS URL on your
+   * app's registered domain — validated server-side; invalid values show
+   * the buyer a "misconfigured link" page. Defaults to your app's
+   * registered Login URL. */
+  next?: string;
+  /** Affiliate code to credit for the sale. */
+  ref?: string;
+  /** Prefills the buyer's email on the checkout page. */
+  email?: string;
+}
+
+/**
+ * Build the hosted purchase (checkout) URL for one of your app's prices.
+ * Pure URL builder — no network. `priceId` is the opaque public price
+ * identifier (`prc_…`) from {@link getPrices} — or just use each price's
+ * ready-made `buy_url` directly.
+ *
+ * Uses config only for the API URL. Being pure, the logic is trivially
+ * copyable into browser code even though this package is Node-only.
+ */
+export function purchaseUrl(priceId: string, opts: PurchaseUrlOptions = {}): string {
+  if (!priceId || !priceId.trim()) {
+    throw new UtaError("priceId must be a non-empty string");
+  }
+  const params = new URLSearchParams();
+  if (opts.next) params.set("next", opts.next);
+  if (opts.ref) params.set("ref", opts.ref);
+  if (opts.email) params.set("email", opts.email);
+  const url = `${resolveApiUrl()}/buy/${encodeURIComponent(priceId)}/`;
+  const qs = params.toString();
+  return qs ? `${url}?${qs}` : url;
+}
+
+export interface ManageUrlOptions {
+  /** Becomes the "Back to app" link on the management page. */
+  next?: string;
+}
+
+/**
+ * Build the URL of the buyer's subscription-management page scoped to this
+ * app. Pure URL builder — no network. Requires `UTA_CLIENT_ID`.
+ */
+export function manageUrl(opts: ManageUrlOptions = {}): string {
+  const url = `${resolveApiUrl()}/manage/${encodeURIComponent(resolveClientId())}/`;
+  if (!opts.next) return url;
+  return `${url}?${new URLSearchParams({ next: opts.next }).toString()}`;
+}
+
+export interface GetAppInfoOptions {
+  /** Override the per-request timeout (seconds). */
+  timeoutSeconds?: number;
+}
+
+/**
+ * Fetch your app's public listing info (name, tagline, listing mode, URLs).
+ * Anonymous — no Authorization header is sent, so no login is needed.
+ */
+export async function getAppInfo(opts: GetAppInfoOptions = {}): Promise<AppInfo> {
+  const url = resolveApiUrl() + PUBLIC_APPS_PATH + encodeURIComponent(resolveClientId()) + "/";
+  const data = await publicApiGet(url, "app info", opts.timeoutSeconds ?? resolveRequestTimeoutSeconds());
+  return parseAppInfo(data);
+}
+
+export interface GetPricesOptions {
+  /** Override the per-request timeout (seconds). */
+  timeoutSeconds?: number;
+}
+
+/**
+ * Fetch your app's public price list. Anonymous — no Authorization header
+ * is sent, so no login is needed. Render your pricing from this API instead
+ * of hardcoding amounts. Each price's `product_id` is the opaque `prod_…`
+ * identifier to gate on — compare it against
+ * {@link Entitlement.product_public_id} (`Entitlement.product_id` still
+ * carries the legacy UUID until the platform's identifier cutover). Each
+ * `buy_url` is the ready-made hosted checkout link.
+ */
+export async function getPrices(opts: GetPricesOptions = {}): Promise<AppPrices> {
+  const url = resolveApiUrl() + PUBLIC_APPS_PATH + encodeURIComponent(resolveClientId()) + "/prices/";
+  const data = await publicApiGet(url, "prices", opts.timeoutSeconds ?? resolveRequestTimeoutSeconds());
+  return parsePrices(data);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -273,7 +375,7 @@ async function tokenRequest(
     body.set("client_id", cfg.client_id);
   }
 
-  let resp: Response;
+  let resp: TimedResponse;
   try {
     resp = await fetchWithTimeout(
       meta.token_endpoint,
@@ -283,7 +385,7 @@ async function tokenRequest(
   } catch (e) {
     throw new UtaServerError(`network error calling token endpoint: ${errMessage(e)}`);
   }
-  const text = await resp.text();
+  const text = resp.text;
   if (resp.status >= 500) {
     throw new UtaServerError(`${resp.status} from token endpoint: ${text}`);
   }
@@ -327,7 +429,9 @@ async function validateIdToken(
   if (typeof payload.sub !== "string" || !payload.sub) {
     throw new UtaTokenError("ID token missing sub");
   }
-  if (nonce != null && payload.nonce !== nonce) {
+  // `null` means the caller legitimately expects no nonce (refresh grant);
+  // anything else — including a missing/undefined value — must match exactly.
+  if (nonce !== null && payload.nonce !== nonce) {
     throw new UtaTokenError("ID token nonce mismatch");
   }
   return payload;
@@ -363,24 +467,118 @@ function raiseForEntitlementStatus(status: number, bodyText: string): void {
   if (status === 403) {
     throw new UtaPermissionError(`403 from entitlement — missing 'entitlements' scope: ${bodyText}`);
   }
+  if (status === 429) {
+    throw new UtaServerError(`429 from entitlement — rate limited, retry with backoff: ${bodyText}`);
+  }
   if (status >= 500 && status < 600) {
     throw new UtaServerError(`${status} from entitlement: ${bodyText}`);
   }
   throw new UtaError(`unexpected status ${status} from entitlement: ${bodyText}`);
 }
 
-function parseEntitlement(data: unknown): Entitlement {
-  if (data === null || typeof data !== "object" || Array.isArray(data)) {
-    throw new UtaError("entitlement response is not a JSON object");
-  }
-  const obj = data as Record<string, unknown>;
+function parseEntitlement(obj: Record<string, unknown>): Entitlement {
   return {
     entitled: Boolean(obj.entitled),
     version: typeof obj.version === "string" ? obj.version : null,
     product_id: typeof obj.product_id === "string" ? obj.product_id : null,
+    product_public_id:
+      typeof obj.product_public_id === "string" ? obj.product_public_id : null,
     status: typeof obj.status === "string" ? obj.status : "none",
     is_free: Boolean(obj.is_free),
     period_end: typeof obj.period_end === "string" ? obj.period_end : null,
+    raw: obj,
+  };
+}
+
+/** GET `url`, raise typed errors per `raiseForStatus`, decode the JSON object. */
+async function apiGetJson(
+  url: string,
+  what: string,
+  timeoutSeconds: number,
+  headers: Record<string, string>,
+  raiseForStatus: (status: number, bodyText: string) => void,
+): Promise<Record<string, unknown>> {
+  let resp: TimedResponse;
+  try {
+    resp = await fetchWithTimeout(url, { headers }, timeoutSeconds);
+  } catch (e) {
+    throw new UtaServerError(`network error calling ${what}: ${errMessage(e)}`);
+  }
+  raiseForStatus(resp.status, resp.text);
+  let data: unknown;
+  try {
+    data = JSON.parse(resp.text);
+  } catch (e) {
+    throw new UtaError(`${what} response is not valid JSON: ${errMessage(e)}`);
+  }
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    throw new UtaError(`${what} response is not a JSON object`);
+  }
+  return data as Record<string, unknown>;
+}
+
+/** Anonymous GET against the public API; returns the decoded JSON object. */
+function publicApiGet(
+  url: string,
+  what: string,
+  timeoutSeconds: number,
+): Promise<Record<string, unknown>> {
+  return apiGetJson(url, what, timeoutSeconds, {}, (status, bodyText) =>
+    raiseForPublicApiStatus(status, what, bodyText),
+  );
+}
+
+function raiseForPublicApiStatus(status: number, what: string, bodyText: string): void {
+  if (status >= 200 && status < 300) return;
+  if (status === 404) {
+    throw new UtaError(
+      `404 from ${what} — app unknown, unpublished, or external sales not enabled: ${bodyText}`,
+    );
+  }
+  if (status === 429) {
+    throw new UtaServerError(`429 from ${what} — rate limited, retry with backoff: ${bodyText}`);
+  }
+  if (status >= 500 && status < 600) {
+    throw new UtaServerError(`${status} from ${what}: ${bodyText}`);
+  }
+  throw new UtaError(`unexpected status ${status} from ${what}: ${bodyText}`);
+}
+
+function parseAppInfo(obj: Record<string, unknown>): AppInfo {
+  return {
+    client_id: typeof obj.client_id === "string" ? obj.client_id : "",
+    name: typeof obj.name === "string" ? obj.name : "",
+    tagline: typeof obj.tagline === "string" ? obj.tagline : "",
+    listing_mode: typeof obj.listing_mode === "string" ? obj.listing_mode : "",
+    url: typeof obj.url === "string" ? obj.url : "",
+    marketplace_url: typeof obj.marketplace_url === "string" ? obj.marketplace_url : "",
+    raw: obj,
+  };
+}
+
+function parsePrice(data: unknown): UtaPrice {
+  const obj =
+    data !== null && typeof data === "object" && !Array.isArray(data)
+      ? (data as Record<string, unknown>)
+      : {};
+  return {
+    public_id: typeof obj.public_id === "string" ? obj.public_id : "",
+    product_id: typeof obj.product_id === "string" ? obj.product_id : "",
+    product_name: typeof obj.product_name === "string" ? obj.product_name : "",
+    amount: typeof obj.amount === "string" ? obj.amount : "",
+    currency: typeof obj.currency === "string" ? obj.currency : "",
+    is_recurring: Boolean(obj.is_recurring),
+    frequency: typeof obj.frequency === "string" ? obj.frequency : null,
+    buy_url: typeof obj.buy_url === "string" ? obj.buy_url : "",
+  };
+}
+
+function parsePrices(obj: Record<string, unknown>): AppPrices {
+  return {
+    client_id: typeof obj.client_id === "string" ? obj.client_id : "",
+    app_name: typeof obj.app_name === "string" ? obj.app_name : "",
+    has_free_tier: Boolean(obj.has_free_tier),
+    prices: Array.isArray(obj.prices) ? obj.prices.map(parsePrice) : [],
     raw: obj,
   };
 }

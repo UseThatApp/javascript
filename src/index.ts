@@ -1,14 +1,22 @@
 export {
   beginLogin,
   completeLogin,
+  getAppInfo,
   getEntitlement,
+  getPrices,
   logoutUrl,
+  manageUrl,
+  purchaseUrl,
   refresh,
   userinfo,
   type BeginLoginOptions,
   type CompleteLoginArgs,
+  type GetAppInfoOptions,
   type GetEntitlementOptions,
+  type GetPricesOptions,
   type LogoutUrlOptions,
+  type ManageUrlOptions,
+  type PurchaseUrlOptions,
 } from "./client.js";
 
 export {
@@ -34,4 +42,4 @@ export {
   UtaTokenError,
 } from "./errors.js";
 
-export type { Entitlement, UtaFlowState, UtaSession } from "./types.js";
+export type { AppInfo, AppPrices, Entitlement, UtaFlowState, UtaPrice, UtaSession } from "./types.js";

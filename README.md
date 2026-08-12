@@ -63,8 +63,13 @@ import {
   refresh,         // (refreshToken) => UtaSession
   userinfo,        // (accessToken) => { sub }
   logoutUrl,       // ({ idToken, postLogoutRedirectUri }) => string
+  purchaseUrl,     // (priceId, { next, ref, email }) => string
+  manageUrl,       // ({ next }) => string
+  getAppInfo,      // () => AppInfo
+  getPrices,       // () => AppPrices
   configure, resetConfig,
   type UtaSession, type Entitlement, type UtaFlowState,
+  type AppInfo, type AppPrices, type UtaPrice,
   // errors:
   UtaError, UtaConfigError, UtaDiscoveryError, UtaAuthError,
   UtaTokenError, UtaPermissionError, UtaServerError,
@@ -94,7 +99,7 @@ saveToSession("utaAccessToken", session.access_token);
 
 // 3) Anywhere you gate features:
 const ent = await getEntitlement(loadFromSession("utaAccessToken"));
-if (ent.entitled && ent.product_id === "...") { /* ... */ }
+if (ent.entitled && ent.product_public_id === "prod_...") { /* ... */ }
 ```
 
 Runnable demos live under [`examples/`](./examples/) — documentation only;
@@ -109,9 +114,64 @@ nothing framework-specific ships in the package.
 | 401    | `UtaTokenError`      | Access token invalid/expired — re-auth/refresh.|
 | 403    | `UtaPermissionError` | Token lacks the `entitlements` scope.          |
 | 400    | `UtaError`           | Client not linked to an app (misconfig).       |
+| 429    | `UtaServerError`     | Rate limited — retriable with backoff.         |
 | 5xx    | `UtaServerError`     | Retriable with backoff.                        |
 
 All inherit from `UtaError` — catch that for a single `catch` clause.
+
+## Purchase links & pricing
+
+usethatapp.com can sell your app directly from your own website: hosted
+checkout links, a buyer management page, and a public pricing API. The SDK
+wraps these thinly — `purchaseUrl`/`manageUrl` are pure URL builders (no
+network), and the pricing API needs **no auth** at all.
+
+The natural upgrade CTA: when an entitlement comes back not entitled, send
+the user to a purchase link.
+
+```js
+import { getEntitlement, purchaseUrl, manageUrl } from "usethatapp";
+
+const ent = await getEntitlement(accessToken);
+if (!ent.entitled) {
+  // Hosted checkout for a specific price (id from getPrices()):
+  return res.redirect(purchaseUrl("prc_...", { next: "https://yourapp.example/welcome" }));
+}
+// Existing buyers manage/cancel their subscription here:
+const billingLink = manageUrl({ next: "https://yourapp.example/settings" });
+```
+
+`purchaseUrl` options: `next` must be an HTTPS URL on your app's registered
+domain (validated server-side — invalid values show the buyer a
+"misconfigured link" page; omit it to land on your registered Login URL),
+`ref` credits an affiliate code, and `email` prefills the buyer's email.
+
+Render pricing from `getPrices()` instead of hardcoding amounts — server-side,
+for example:
+
+```js
+import { getPrices } from "usethatapp";
+
+const { app_name, has_free_tier, prices } = await getPrices();
+const rows = prices.map((p) => {
+  const cadence = p.is_recurring ? `/${p.frequency}` : " one-time";
+  // p.amount is a decimal string like "10.00" — format, don't parseFloat.
+  return `<tr><td>${p.product_name}</td>` +
+    `<td>${p.amount} ${p.currency.toUpperCase()}${cadence}</td>` +
+    `<td><a href="${p.buy_url}">Buy</a></td></tr>`;
+});
+```
+
+Each price's `product_id` is the opaque `prod_…` identifier to gate on —
+compare it against **`Entitlement.product_public_id`** (`Entitlement.product_id`
+still carries the legacy UUID until the platform's identifier cutover, after
+which both fields carry the same `prod_…` value). Each `buy_url` is the
+ready-made hosted checkout link (equivalent to `purchaseUrl(p.public_id)`).
+
+Notes: the pricing API is anonymous and CORS-enabled; UseThatApp is the
+merchant of record; purchases are currently **US-only**; and buy links 404
+until external sales is enabled for your app (currently in beta). Details at
+[docs.usethatapp.com](https://docs.usethatapp.com).
 
 ## Signing out
 
@@ -149,6 +209,81 @@ npm test        # build + node:test suite
 ```
 
 ## Changelog
+
+### 2.1.0 (2026-08-11)
+
+Thin support for selling your app from your own website (hosted purchase
+links, buyer management page, public pricing API), plus OIDC hardening.
+The new surface is additive, but the hardening tightens some previously
+lax behavior — see *Security* and *Changed* below before upgrading.
+
+**Added**
+
+- `purchaseUrl(priceId, { next, ref, email })` — pure builder for the hosted
+  checkout URL of a price.
+- `manageUrl({ next })` — pure builder for the buyer's subscription-management
+  page URL for your app.
+- `getAppInfo()` → `AppInfo` — the app's public listing info (anonymous, no
+  auth).
+- `getPrices()` → `AppPrices` — the app's public price list (anonymous, no
+  auth); each `UtaPrice` carries a ready-made `buy_url` and a `product_id`
+  matching `Entitlement.product_public_id` (not the legacy
+  `Entitlement.product_id` UUID).
+- New types: `AppInfo`, `AppPrices`, `UtaPrice`.
+- `Entitlement.product_public_id` — the opaque public product identifier
+  (`prod_…`) matching `UtaPrice.product_id` from the pricing API. New
+  integrations should gate on it; `Entitlement.product_id` currently
+  carries a legacy UUID and will converge on the same `prod_…` value.
+
+**Security**
+
+These close real gaps in 2.0.0's OIDC flow. Each one turns a case that
+used to pass silently into a thrown error, so an integration relying on
+the old leniency will now see an exception instead.
+
+- **Discovery issuer is verified.** A discovery document whose `issuer`
+  does not match the configured `UTA_ISSUER` is rejected with
+  `UtaDiscoveryError` (and never cached). Previously ID tokens were
+  validated against whatever `issuer`/`jwks_uri` the document declared,
+  so a misconfigured or hostile discovery endpoint could get tokens from
+  a different issuer accepted.
+- **A missing nonce no longer skips replay protection.** `completeLogin`
+  throws `UtaAuthError` when `flowState` lacks `nonce`/`codeVerifier` —
+  e.g. when a session layer drops fields — instead of silently omitting
+  the nonce check.
+- **`userinfo()` rejects every non-2xx response** (403 →
+  `UtaPermissionError`), and `refresh()` throws `UtaTokenError` on a
+  missing/empty `sub`. Previously a 403/404/400 error body was returned
+  as claims, producing a session with `sub === ""` that collided every
+  affected user onto one identity.
+- **`beginLogin` rejects reserved `extraParams`.** Passing a key that
+  collides with `state`, `nonce`, `code_challenge`, `redirect_uri`,
+  `client_id`, … now throws `UtaError` rather than overwriting the value
+  recorded in `flowState` and breaking CSRF/PKCE protection.
+- **An empty `UTA_CLIENT_SECRET` no longer shadows
+  `UTA_CLIENT_SECRET_PATH`.** A blank env var now falls through to the
+  mounted secret file instead of demoting the app to a public client.
+
+**Changed**
+
+- Request timeouts now cover the response body, not just the headers. A
+  server that sends headers and then stalls fails after
+  `UTA_REQUEST_TIMEOUT_SECONDS` instead of hanging indefinitely.
+- `UTA_REQUEST_TIMEOUT_SECONDS` must be ≥ 1 and `UTA_CLOCK_SKEW_SECONDS`
+  ≥ 0; out-of-range values raise `UtaConfigError` at config load.
+  Previously `0` was accepted and aborted every request immediately.
+- `getEntitlement` maps 429 to `UtaServerError` (retriable with backoff)
+  instead of a generic non-retriable `UtaError`, matching the public
+  pricing endpoints.
+
+**Fixed**
+
+- Gating guidance: the quickstart and `getPrices` docs now compare a
+  price's `product_id` against `Entitlement.product_public_id`. The old
+  wording pointed at `Entitlement.product_id`, whose legacy UUID makes
+  the comparison false for every buyer.
+- The example apps map `UtaServerError` to HTTP 502 rather than 400, so
+  a provider outage is not reported as a client error.
 
 ### 2.0.0
 

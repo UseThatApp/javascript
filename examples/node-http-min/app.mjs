@@ -9,7 +9,7 @@
 import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
 
-import { beginLogin, completeLogin, getEntitlement, logoutUrl, UtaError, UtaTokenError } from "usethatapp";
+import { beginLogin, completeLogin, getEntitlement, logoutUrl, UtaError, UtaServerError, UtaTokenError } from "usethatapp";
 
 // Toy server-side session store keyed by a cookie. Use a real session in prod.
 const sessions = new Map();
@@ -72,7 +72,10 @@ export function createApp() {
         res.end('<a href="/login">Log in with UseThatApp</a>');
       }
     } catch (e) {
-      res.writeHead(e instanceof UtaError ? 400 : 500).end(`error: ${e.message}`);
+      // UtaServerError = provider 5xx/network trouble (retriable upstream
+      // outage), not a bad request from the client.
+      const code = e instanceof UtaServerError ? 502 : e instanceof UtaError ? 400 : 500;
+      res.writeHead(code).end(`error: ${e.message}`);
     }
   });
 }
