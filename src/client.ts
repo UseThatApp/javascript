@@ -30,7 +30,7 @@ import {
   UtaServerError,
   UtaTokenError,
 } from "./errors.js";
-import { errMessage, fetchWithTimeout } from "./http.js";
+import { errMessage, fetchWithTimeout, type TimedResponse } from "./http.js";
 import type { AppInfo, AppPrices, Entitlement, UtaFlowState, UtaPrice, UtaSession } from "./types.js";
 
 const ENTITLEMENT_PATH = "/licensing/entitlement/";
@@ -93,7 +93,14 @@ export async function beginLogin(
     code_challenge_method: "S256",
   });
   if (opts.prompt) params.set("prompt", opts.prompt);
-  for (const [k, v] of Object.entries(opts.extraParams ?? {})) params.set(k, v);
+  for (const [k, v] of Object.entries(opts.extraParams ?? {})) {
+    // Silently overwriting state/nonce/code_challenge/... would break the
+    // CSRF, replay, and PKCE protections recorded in flowState.
+    if (params.has(k)) {
+      throw new UtaError(`extraParams may not override reserved parameter '${k}'`);
+    }
+    params.set(k, v);
+  }
 
   return {
     authorizationUrl: meta.authorization_endpoint + "?" + params.toString(),
@@ -118,6 +125,13 @@ export async function completeLogin(args: CompleteLoginArgs): Promise<UtaSession
   if (!code) throw new UtaAuthError("missing authorization code");
   if (!flowState?.state || !timingSafeEqualStr(String(state ?? ""), flowState.state)) {
     throw new UtaAuthError("state mismatch — possible CSRF or a stale login");
+  }
+  // Fail loudly if the session layer dropped fields — a missing nonce would
+  // otherwise silently disable replay protection.
+  if (!flowState.nonce || !flowState.codeVerifier) {
+    throw new UtaAuthError(
+      "flowState is missing nonce/codeVerifier — was it stored and restored intact?",
+    );
   }
 
   const meta = await getMetadata(cfg);
@@ -163,7 +177,10 @@ export async function refresh(refreshToken: string): Promise<UtaSession> {
     return sessionFromToken(token, String(claims.sub), claims, idToken);
   }
   const info = await userinfo(String(token.access_token));
-  return sessionFromToken(token, String(info.sub ?? ""), info, null);
+  if (typeof info.sub !== "string" || !info.sub) {
+    throw new UtaTokenError("userinfo response missing sub");
+  }
+  return sessionFromToken(token, info.sub, info, null);
 }
 
 /** Fetch the OIDC userinfo claims (`sub` only — no PII). */
@@ -171,7 +188,7 @@ export async function userinfo(accessToken: string): Promise<Record<string, unkn
   const cfg = loadConfig();
   const meta = await getMetadata(cfg);
   if (!meta.userinfo_endpoint) throw new UtaError("provider has no userinfo_endpoint");
-  let resp: Response;
+  let resp: TimedResponse;
   try {
     resp = await fetchWithTimeout(
       meta.userinfo_endpoint,
@@ -181,10 +198,12 @@ export async function userinfo(accessToken: string): Promise<Record<string, unkn
   } catch (e) {
     throw new UtaServerError(`network error calling userinfo: ${errMessage(e)}`);
   }
-  if (resp.status === 401) throw new UtaTokenError(`401 from userinfo: ${await resp.text()}`);
+  if (resp.status === 401) throw new UtaTokenError(`401 from userinfo: ${resp.text}`);
+  if (resp.status === 403) throw new UtaPermissionError(`403 from userinfo: ${resp.text}`);
   if (resp.status >= 500) throw new UtaServerError(`${resp.status} from userinfo`);
+  if (!resp.ok) throw new UtaError(`unexpected status ${resp.status} from userinfo: ${resp.text}`);
   try {
-    return (await resp.json()) as Record<string, unknown>;
+    return JSON.parse(resp.text) as Record<string, unknown>;
   } catch (e) {
     throw new UtaError(`userinfo response is not valid JSON: ${errMessage(e)}`);
   }
@@ -235,25 +254,13 @@ export async function getEntitlement(
 ): Promise<Entitlement> {
   const cfg = loadConfig();
   if (!accessToken) throw new UtaTokenError("accessToken must be a non-empty string");
-  const url = cfg.api_url + ENTITLEMENT_PATH;
-  let resp: Response;
-  try {
-    resp = await fetchWithTimeout(
-      url,
-      { headers: { Authorization: `Bearer ${accessToken}` } },
-      opts.timeoutSeconds ?? cfg.request_timeout_seconds,
-    );
-  } catch (e) {
-    throw new UtaServerError(`network error calling entitlement: ${errMessage(e)}`);
-  }
-  const text = await resp.text();
-  raiseForEntitlementStatus(resp.status, text);
-  let data: unknown;
-  try {
-    data = JSON.parse(text);
-  } catch (e) {
-    throw new UtaError(`entitlement response is not valid JSON: ${errMessage(e)}`);
-  }
+  const data = await apiGetJson(
+    cfg.api_url + ENTITLEMENT_PATH,
+    "entitlement",
+    opts.timeoutSeconds ?? cfg.request_timeout_seconds,
+    { Authorization: `Bearer ${accessToken}` },
+    raiseForEntitlementStatus,
+  );
   return parseEntitlement(data);
 }
 
@@ -368,7 +375,7 @@ async function tokenRequest(
     body.set("client_id", cfg.client_id);
   }
 
-  let resp: Response;
+  let resp: TimedResponse;
   try {
     resp = await fetchWithTimeout(
       meta.token_endpoint,
@@ -378,7 +385,7 @@ async function tokenRequest(
   } catch (e) {
     throw new UtaServerError(`network error calling token endpoint: ${errMessage(e)}`);
   }
-  const text = await resp.text();
+  const text = resp.text;
   if (resp.status >= 500) {
     throw new UtaServerError(`${resp.status} from token endpoint: ${text}`);
   }
@@ -422,7 +429,9 @@ async function validateIdToken(
   if (typeof payload.sub !== "string" || !payload.sub) {
     throw new UtaTokenError("ID token missing sub");
   }
-  if (nonce != null && payload.nonce !== nonce) {
+  // `null` means the caller legitimately expects no nonce (refresh grant);
+  // anything else — including a missing/undefined value — must match exactly.
+  if (nonce !== null && payload.nonce !== nonce) {
     throw new UtaTokenError("ID token nonce mismatch");
   }
   return payload;
@@ -458,17 +467,16 @@ function raiseForEntitlementStatus(status: number, bodyText: string): void {
   if (status === 403) {
     throw new UtaPermissionError(`403 from entitlement — missing 'entitlements' scope: ${bodyText}`);
   }
+  if (status === 429) {
+    throw new UtaServerError(`429 from entitlement — rate limited, retry with backoff: ${bodyText}`);
+  }
   if (status >= 500 && status < 600) {
     throw new UtaServerError(`${status} from entitlement: ${bodyText}`);
   }
   throw new UtaError(`unexpected status ${status} from entitlement: ${bodyText}`);
 }
 
-function parseEntitlement(data: unknown): Entitlement {
-  if (data === null || typeof data !== "object" || Array.isArray(data)) {
-    throw new UtaError("entitlement response is not a JSON object");
-  }
-  const obj = data as Record<string, unknown>;
+function parseEntitlement(obj: Record<string, unknown>): Entitlement {
   return {
     entitled: Boolean(obj.entitled),
     version: typeof obj.version === "string" ? obj.version : null,
@@ -482,23 +490,24 @@ function parseEntitlement(data: unknown): Entitlement {
   };
 }
 
-/** Anonymous GET against the public API; returns the decoded JSON object. */
-async function publicApiGet(
+/** GET `url`, raise typed errors per `raiseForStatus`, decode the JSON object. */
+async function apiGetJson(
   url: string,
   what: string,
   timeoutSeconds: number,
+  headers: Record<string, string>,
+  raiseForStatus: (status: number, bodyText: string) => void,
 ): Promise<Record<string, unknown>> {
-  let resp: Response;
+  let resp: TimedResponse;
   try {
-    resp = await fetchWithTimeout(url, {}, timeoutSeconds);
+    resp = await fetchWithTimeout(url, { headers }, timeoutSeconds);
   } catch (e) {
     throw new UtaServerError(`network error calling ${what}: ${errMessage(e)}`);
   }
-  const text = await resp.text();
-  raiseForPublicApiStatus(resp.status, what, text);
+  raiseForStatus(resp.status, resp.text);
   let data: unknown;
   try {
-    data = JSON.parse(text);
+    data = JSON.parse(resp.text);
   } catch (e) {
     throw new UtaError(`${what} response is not valid JSON: ${errMessage(e)}`);
   }
@@ -506,6 +515,17 @@ async function publicApiGet(
     throw new UtaError(`${what} response is not a JSON object`);
   }
   return data as Record<string, unknown>;
+}
+
+/** Anonymous GET against the public API; returns the decoded JSON object. */
+function publicApiGet(
+  url: string,
+  what: string,
+  timeoutSeconds: number,
+): Promise<Record<string, unknown>> {
+  return apiGetJson(url, what, timeoutSeconds, {}, (status, bodyText) =>
+    raiseForPublicApiStatus(status, what, bodyText),
+  );
 }
 
 function raiseForPublicApiStatus(status: number, what: string, bodyText: string): void {

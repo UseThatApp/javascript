@@ -2,6 +2,9 @@
 // Mocks global fetch and mints signed ID tokens with jose.
 import test, { beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { SignJWT, exportJWK, generateKeyPair } from "jose";
 
@@ -15,6 +18,9 @@ import {
   resetConfig,
   resetDiscoveryCache,
   UtaAuthError,
+  UtaConfigError,
+  UtaDiscoveryError,
+  UtaError,
   UtaPermissionError,
   UtaServerError,
   UtaTokenError,
@@ -69,11 +75,11 @@ function json(status, body, headers = {}) {
 let routes;
 
 function installFetch() {
-  globalThis.fetch = async (url) => {
+  globalThis.fetch = async (url, init) => {
     const u = String(url);
     if (u.includes("/.well-known/openid-configuration")) return json(200, META);
     if (u === META.jwks_uri) return json(200, { keys: [keys.publicJwk] });
-    if (u === META.token_endpoint) return routes.token();
+    if (u === META.token_endpoint) return routes.token(init);
     if (u === META.userinfo_endpoint) return routes.userinfo();
     if (u.startsWith(API_URL + "/licensing/entitlement/")) return routes.entitlement();
     throw new Error("unexpected fetch: " + u);
@@ -122,6 +128,20 @@ test("beginLogin state/verifier are random per call", async () => {
   assert.notEqual(a.flowState.codeVerifier, b.flowState.codeVerifier);
 });
 
+test("beginLogin allows benign extraParams", async () => {
+  const { authorizationUrl } = await beginLogin({ extraParams: { ui_locales: "de" } });
+  assert.equal(new URL(authorizationUrl).searchParams.get("ui_locales"), "de");
+});
+
+test("beginLogin rejects extraParams that override reserved params", async () => {
+  for (const key of ["state", "nonce", "code_challenge", "redirect_uri", "client_id"]) {
+    await assert.rejects(
+      beginLogin({ extraParams: { [key]: "attacker" } }),
+      (e) => e instanceof UtaError && e.message.includes(key),
+    );
+  }
+});
+
 // ── completeLogin ─────────────────────────────────────────────────────
 
 function flow(overrides = {}) {
@@ -146,6 +166,19 @@ test("completeLogin rejects state mismatch", async () => {
     completeLogin({ code: "abc", state: "WRONG", flowState: flow() }),
     UtaAuthError,
   );
+});
+
+test("completeLogin rejects flowState with a missing nonce", async () => {
+  const { nonce, ...withoutNonce } = flow();
+  await assert.rejects(
+    completeLogin({ code: "abc", state: "st", flowState: withoutNonce }),
+    UtaAuthError,
+  );
+});
+
+test("discovery rejects a document whose issuer does not match the configured issuer", async () => {
+  configure({ issuer: "https://evil.test.example/o" });
+  await assert.rejects(beginLogin(), UtaDiscoveryError);
 });
 
 test("completeLogin rejects nonce mismatch", async () => {
@@ -208,12 +241,17 @@ test("getEntitlement returns a free entitlement", async () => {
   assert.equal(ent.status, "free");
 });
 
-for (const [status, ctor] of [[401, UtaTokenError], [403, UtaPermissionError], [500, UtaServerError]]) {
+for (const [status, ctor] of [[401, UtaTokenError], [403, UtaPermissionError], [429, UtaServerError], [500, UtaServerError]]) {
   test(`getEntitlement maps ${status}`, async () => {
     routes.entitlement = () => json(status, "nope");
     await assert.rejects(getEntitlement("at-123"), ctor);
   });
 }
+
+test("non-positive UTA_REQUEST_TIMEOUT_SECONDS is a config error", async () => {
+  configure({ request_timeout_seconds: 0 });
+  await assert.rejects(getEntitlement("at-123"), UtaConfigError);
+});
 
 // ── refresh / logout ──────────────────────────────────────────────────
 
@@ -235,6 +273,32 @@ test("refresh without id token falls back to userinfo + carries refresh token fo
   const s = await refresh("rt-456");
   assert.equal(s.sub, "pairwise-sub-abc");
   assert.equal(s.refresh_token, "rt-456");
+});
+
+test("refresh rejects a userinfo response missing sub", async () => {
+  routes.token = () => json(200, { access_token: "at-new", token_type: "Bearer", expires_in: 1800 });
+  routes.userinfo = () => json(200, {});
+  await assert.rejects(refresh("rt-456"), UtaTokenError);
+});
+
+test("refresh surfaces a userinfo 403 instead of treating the error body as claims", async () => {
+  routes.token = () => json(200, { access_token: "at-new", token_type: "Bearer", expires_in: 1800 });
+  routes.userinfo = () => json(403, { detail: "missing scope" });
+  await assert.rejects(refresh("rt-456"), UtaPermissionError);
+});
+
+test("empty UTA_CLIENT_SECRET falls through to UTA_CLIENT_SECRET_PATH", async () => {
+  const secretPath = join(mkdtempSync(join(tmpdir(), "uta-test-")), "secret");
+  writeFileSync(secretPath, "file-secret\n");
+  configure({ client_secret: "", client_secret_path: secretPath });
+  const idToken = await makeIdToken({ nonce: "test-nonce" });
+  let auth;
+  routes.token = (init) => {
+    auth = init.headers.Authorization;
+    return json(200, { access_token: "at", id_token: idToken, expires_in: 1800 });
+  };
+  await completeLogin({ code: "abc", state: "st", flowState: flow() });
+  assert.equal(auth, "Basic " + Buffer.from(`${CLIENT_ID}:file-secret`).toString("base64"));
 });
 
 test("logoutUrl builds the end-session URL", async () => {

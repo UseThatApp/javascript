@@ -99,7 +99,7 @@ saveToSession("utaAccessToken", session.access_token);
 
 // 3) Anywhere you gate features:
 const ent = await getEntitlement(loadFromSession("utaAccessToken"));
-if (ent.entitled && ent.product_id === "...") { /* ... */ }
+if (ent.entitled && ent.product_public_id === "prod_...") { /* ... */ }
 ```
 
 Runnable demos live under [`examples/`](./examples/) — documentation only;
@@ -114,6 +114,7 @@ nothing framework-specific ships in the package.
 | 401    | `UtaTokenError`      | Access token invalid/expired — re-auth/refresh.|
 | 403    | `UtaPermissionError` | Token lacks the `entitlements` scope.          |
 | 400    | `UtaError`           | Client not linked to an app (misconfig).       |
+| 429    | `UtaServerError`     | Rate limited — retriable with backoff.         |
 | 5xx    | `UtaServerError`     | Retriable with backoff.                        |
 
 All inherit from `UtaError` — catch that for a single `catch` clause.
@@ -225,7 +226,8 @@ public pricing API).
   auth).
 - `getPrices()` → `AppPrices` — the app's public price list (anonymous, no
   auth); each `UtaPrice` carries a ready-made `buy_url` and a `product_id`
-  matching the entitlement endpoint's.
+  matching `Entitlement.product_public_id` (not the legacy
+  `Entitlement.product_id` UUID).
 - New types: `AppInfo`, `AppPrices`, `UtaPrice`.
 - `Entitlement.product_public_id` — the opaque public product identifier
   (`prod_…`) matching `UtaPrice.product_id` from the pricing API. New

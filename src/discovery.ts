@@ -36,7 +36,7 @@ export async function getMetadata(cfg: UtaConfig): Promise<OidcMetadata> {
   try {
     const resp = await fetchWithTimeout(url, {}, cfg.request_timeout_seconds);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    data = await resp.json();
+    data = JSON.parse(resp.text);
   } catch (e) {
     throw new UtaDiscoveryError(`failed to fetch OIDC discovery from ${url}: ${errMessage(e)}`);
   }
@@ -49,6 +49,15 @@ export async function getMetadata(cfg: UtaConfig): Promise<OidcMetadata> {
     if (typeof meta[key] !== "string") {
       throw new UtaDiscoveryError(`discovery document missing '${key}'`);
     }
+  }
+
+  // OIDC discovery requires the document's issuer to equal the issuer it was
+  // fetched from. Without this check, ID tokens would be validated against
+  // whatever issuer/jwks_uri a misconfigured or hostile document declares.
+  if (meta.issuer.replace(/\/+$/, "") !== cfg.issuer) {
+    throw new UtaDiscoveryError(
+      `discovery document issuer '${meta.issuer}' does not match configured issuer '${cfg.issuer}'`,
+    );
   }
 
   metadataCache.set(cfg.issuer, meta);
