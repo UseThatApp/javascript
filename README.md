@@ -210,11 +210,12 @@ npm test        # build + node:test suite
 
 ## Changelog
 
-### 2.1.0 (2026-07-30)
+### 2.1.0 (2026-08-11)
 
-Purely additive — nothing existing changed. Thin support for selling your
-app from your own website (hosted purchase links, buyer management page,
-public pricing API).
+Thin support for selling your app from your own website (hosted purchase
+links, buyer management page, public pricing API), plus OIDC hardening.
+The new surface is additive, but the hardening tightens some previously
+lax behavior — see *Security* and *Changed* below before upgrading.
 
 **Added**
 
@@ -233,6 +234,56 @@ public pricing API).
   (`prod_…`) matching `UtaPrice.product_id` from the pricing API. New
   integrations should gate on it; `Entitlement.product_id` currently
   carries a legacy UUID and will converge on the same `prod_…` value.
+
+**Security**
+
+These close real gaps in 2.0.0's OIDC flow. Each one turns a case that
+used to pass silently into a thrown error, so an integration relying on
+the old leniency will now see an exception instead.
+
+- **Discovery issuer is verified.** A discovery document whose `issuer`
+  does not match the configured `UTA_ISSUER` is rejected with
+  `UtaDiscoveryError` (and never cached). Previously ID tokens were
+  validated against whatever `issuer`/`jwks_uri` the document declared,
+  so a misconfigured or hostile discovery endpoint could get tokens from
+  a different issuer accepted.
+- **A missing nonce no longer skips replay protection.** `completeLogin`
+  throws `UtaAuthError` when `flowState` lacks `nonce`/`codeVerifier` —
+  e.g. when a session layer drops fields — instead of silently omitting
+  the nonce check.
+- **`userinfo()` rejects every non-2xx response** (403 →
+  `UtaPermissionError`), and `refresh()` throws `UtaTokenError` on a
+  missing/empty `sub`. Previously a 403/404/400 error body was returned
+  as claims, producing a session with `sub === ""` that collided every
+  affected user onto one identity.
+- **`beginLogin` rejects reserved `extraParams`.** Passing a key that
+  collides with `state`, `nonce`, `code_challenge`, `redirect_uri`,
+  `client_id`, … now throws `UtaError` rather than overwriting the value
+  recorded in `flowState` and breaking CSRF/PKCE protection.
+- **An empty `UTA_CLIENT_SECRET` no longer shadows
+  `UTA_CLIENT_SECRET_PATH`.** A blank env var now falls through to the
+  mounted secret file instead of demoting the app to a public client.
+
+**Changed**
+
+- Request timeouts now cover the response body, not just the headers. A
+  server that sends headers and then stalls fails after
+  `UTA_REQUEST_TIMEOUT_SECONDS` instead of hanging indefinitely.
+- `UTA_REQUEST_TIMEOUT_SECONDS` must be ≥ 1 and `UTA_CLOCK_SKEW_SECONDS`
+  ≥ 0; out-of-range values raise `UtaConfigError` at config load.
+  Previously `0` was accepted and aborted every request immediately.
+- `getEntitlement` maps 429 to `UtaServerError` (retriable with backoff)
+  instead of a generic non-retriable `UtaError`, matching the public
+  pricing endpoints.
+
+**Fixed**
+
+- Gating guidance: the quickstart and `getPrices` docs now compare a
+  price's `product_id` against `Entitlement.product_public_id`. The old
+  wording pointed at `Entitlement.product_id`, whose legacy UUID makes
+  the comparison false for every buyer.
+- The example apps map `UtaServerError` to HTTP 502 rather than 400, so
+  a provider outage is not reported as a client error.
 
 ### 2.0.0
 
