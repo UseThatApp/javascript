@@ -28,6 +28,7 @@ import {
   UtaError,
   UtaPermissionError,
   UtaServerError,
+  UtaServiceNotEnabledError,
   UtaTokenError,
 } from "./errors.js";
 import { errMessage, fetchWithTimeout, type TimedResponse } from "./http.js";
@@ -465,6 +466,16 @@ function raiseForEntitlementStatus(status: number, bodyText: string): void {
     throw new UtaTokenError(`401 from entitlement — access token invalid/expired: ${bodyText}`);
   }
   if (status === 403) {
+    // Two distinct 403s (see the server's EntitlementView contract):
+    // insufficient_scope (fix the requested scopes) vs service_not_enabled
+    // (the developer must enable the add-on — nothing here will fix it).
+    if (errorCode(bodyText) === "service_not_enabled") {
+      throw new UtaServiceNotEnabledError(
+        "403 from entitlement — the entitlement service is not enabled " +
+        "for this app. Enable the Auth & Entitlement add-on on the " +
+        `app's manage page at usethatapp.com (Integration panel): ${bodyText}`,
+      );
+    }
     throw new UtaPermissionError(`403 from entitlement — missing 'entitlements' scope: ${bodyText}`);
   }
   if (status === 429) {
@@ -474,6 +485,22 @@ function raiseForEntitlementStatus(status: number, bodyText: string): void {
     throw new UtaServerError(`${status} from entitlement: ${bodyText}`);
   }
   throw new UtaError(`unexpected status ${status} from entitlement: ${bodyText}`);
+}
+
+/**
+ * The `error` field of a JSON error body, or "" when the body is not
+ * JSON / not an object / has no string error code.
+ */
+function errorCode(bodyText: string): string {
+  let data: unknown;
+  try {
+    data = JSON.parse(bodyText);
+  } catch {
+    return "";
+  }
+  if (typeof data !== "object" || data === null) return "";
+  const code = (data as Record<string, unknown>).error;
+  return typeof code === "string" ? code : "";
 }
 
 function parseEntitlement(obj: Record<string, unknown>): Entitlement {

@@ -38,6 +38,7 @@ export {
   UtaDiscoveryError,
   UtaError,
   UtaPermissionError,
+  UtaServiceNotEnabledError,
   UtaServerError,
   UtaTokenError,
 } from "./errors.js";

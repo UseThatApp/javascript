@@ -22,6 +22,7 @@ import {
   UtaDiscoveryError,
   UtaError,
   UtaPermissionError,
+  UtaServiceNotEnabledError,
   UtaServerError,
   UtaTokenError,
 } from "../dist/index.js";
@@ -247,6 +248,28 @@ for (const [status, ctor] of [[401, UtaTokenError], [403, UtaPermissionError], [
     await assert.rejects(getEntitlement("at-123"), ctor);
   });
 }
+
+test("getEntitlement maps 403 service_not_enabled to its own error", async () => {
+  // The developer's to fix (enable the add-on) — must NOT read as a
+  // scope problem, but must stay catchable as UtaPermissionError.
+  routes.entitlement = () => json(403, {
+    error: "service_not_enabled",
+    error_description: "The developer has not enabled the entitlement service for this app.",
+  });
+  await assert.rejects(getEntitlement("at-123"), UtaServiceNotEnabledError);
+  await assert.rejects(getEntitlement("at-123"), UtaPermissionError);
+  await assert.rejects(getEntitlement("at-123"), /manage page/);
+});
+
+test("getEntitlement keeps the exact class for a scope 403", async () => {
+  routes.entitlement = () => json(403, { error: "insufficient_scope", scope: "entitlements" });
+  try {
+    await getEntitlement("at-123");
+    assert.fail("expected a rejection");
+  } catch (err) {
+    assert.equal(err.constructor, UtaPermissionError);
+  }
+});
 
 test("non-positive UTA_REQUEST_TIMEOUT_SECONDS is a config error", async () => {
   configure({ request_timeout_seconds: 0 });
