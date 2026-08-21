@@ -123,3 +123,21 @@ export interface Entitlement {
   /** The full decoded response, for forward-compatibility. */
   readonly raw: Record<string, unknown>;
 }
+
+/**
+ * One license's live state from the License Key API (bring-your-own-auth
+ * verification — no end-user OIDC anywhere). `license_key` is set only by
+ * getOrder and regenerateLicenseKey — the two calls that hand you key
+ * material. Cache `entitled` against `period_end` and re-validate on your
+ * own cadence.
+ */
+export interface LicenseState {
+  entitled: boolean;
+  status: string;
+  license_id: string;
+  product_public_id: string;
+  period_end: string | null;
+  canceled_at: string | null;
+  license_key: string | null;
+  rotated_at: string | null;
+}

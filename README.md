@@ -73,6 +73,7 @@ import {
   // errors:
   UtaError, UtaConfigError, UtaDiscoveryError, UtaAuthError,
   UtaTokenError, UtaPermissionError, UtaServiceNotEnabledError,
+  UtaNotFoundError, UtaOrderProcessingError, UtaLicenseCanceledError,
   UtaServerError,
 } from "usethatapp";
 ```
@@ -122,6 +123,35 @@ nothing framework-specific ships in the package.
 All inherit from `UtaError` — catch that for a single `catch` clause.
 `UtaServiceNotEnabledError` extends `UtaPermissionError`, so existing
 `catch` blocks that test for `UtaPermissionError` keep working unchanged.
+
+## License Key API — bring your own auth
+
+If you keep your own auth (Auth0, Clerk, homegrown) and use UseThatApp
+purely as merchant of record, skip the OIDC flow entirely and verify
+purchases with license keys. Server-side only; set `UTA_CLIENT_SECRET`
+(`UTA_REDIRECT_URI` is not needed for this mode).
+
+```js
+import { getOrder, regenerateLicenseKey, validateLicenseKey } from "usethatapp";
+
+// 1) The buyer returns from checkout with ?uta_order=... — exchange it
+//    for their key and link it to YOUR signed-in user. No email matching.
+const order = await getOrder(req.query.uta_order); // UtaOrderProcessingError → retry briefly
+await db.save({ user: currentUser, licenseKey: order.license_key, licenseId: order.license_id });
+
+// 2) Any time you need the truth (app start, feature gate, cron):
+const state = await validateLicenseKey(storedKey); // LicenseState
+if (state.entitled) { /* cache against state.period_end */ }
+// canceled purchases return entitled=false, status="canceled" — an
+// answer, not an exception. UtaNotFoundError means a key that was
+// never issued for your app.
+
+// 3) Compromised key? Rotate it — the old key dies instantly:
+const rotated = await regenerateLicenseKey(licenseId); // rotated.license_key is the new key
+```
+
+Buyers can always re-view their key on their UseThatApp management
+page, so "I lost my key" needs no support ticket and no rotation.
 
 ## Purchase links & pricing
 
@@ -217,6 +247,15 @@ npm test        # build + node:test suite
 ### Unreleased
 
 **Added**
+
+- **License Key API** (server-side, bring-your-own-auth MoR
+  verification): `validateLicenseKey(key)`, `getOrder(ref)` for the
+  `uta_order` checkout handback, and `regenerateLicenseKey(licenseId)`
+  as the compromise kill switch — all authenticated with your app's
+  client credentials via the new `resolveClientSecret()` partial
+  resolver (no OIDC config needed). New `LicenseState` type and typed
+  errors: `UtaNotFoundError` (with `.code`), `UtaOrderProcessingError`,
+  `UtaLicenseCanceledError`.
 
 - `UtaServiceNotEnabledError` (extends `UtaPermissionError`), thrown when
   the entitlement endpoint returns `403 service_not_enabled`: the app's

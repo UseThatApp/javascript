@@ -49,5 +49,29 @@ export class UtaPermissionError extends UtaError {}
  */
 export class UtaServiceNotEnabledError extends UtaPermissionError {}
 
+/**
+ * The License Key API could not find what you referenced. `code` says
+ * what: `unknown_key` (a key we never issued — or another app's),
+ * `unknown_order` (bad/expired order ref), or `unknown_license` (no such
+ * license id for your app).
+ */
+export class UtaNotFoundError extends UtaError {
+  readonly code: string;
+
+  constructor(message: string, code = "") {
+    super(message);
+    this.code = code;
+  }
+}
+
+/**
+ * The order is genuine but its license hasn't landed yet (payment
+ * webhooks run seconds behind checkout). Retry briefly.
+ */
+export class UtaOrderProcessingError extends UtaError {}
+
+/** The license is terminally canceled — its key cannot be regenerated. */
+export class UtaLicenseCanceledError extends UtaError {}
+
 /** A usethatapp.com endpoint returned 5xx, or the network failed. Retriable. */
 export class UtaServerError extends UtaError {}

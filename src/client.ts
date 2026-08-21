@@ -19,20 +19,25 @@ import {
   loadConfig,
   resolveApiUrl,
   resolveClientId,
+  resolveClientSecret,
   resolveRequestTimeoutSeconds,
   type UtaConfig,
 } from "./config.js";
 import { getJwks, getMetadata, type OidcMetadata } from "./discovery.js";
 import {
   UtaAuthError,
+  UtaConfigError,
   UtaError,
+  UtaLicenseCanceledError,
+  UtaNotFoundError,
+  UtaOrderProcessingError,
   UtaPermissionError,
   UtaServerError,
   UtaServiceNotEnabledError,
   UtaTokenError,
 } from "./errors.js";
 import { errMessage, fetchWithTimeout, type TimedResponse } from "./http.js";
-import type { AppInfo, AppPrices, Entitlement, UtaFlowState, UtaPrice, UtaSession } from "./types.js";
+import type { AppInfo, AppPrices, Entitlement, LicenseState, UtaFlowState, UtaPrice, UtaSession } from "./types.js";
 
 const ENTITLEMENT_PATH = "/licensing/entitlement/";
 const PUBLIC_APPS_PATH = "/api/v1/public/apps/";
@@ -608,4 +613,171 @@ function parsePrices(obj: Record<string, unknown>): AppPrices {
     prices: Array.isArray(obj.prices) ? obj.prices.map(parsePrice) : [],
     raw: obj,
   };
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// License Key API (bring-your-own-auth MoR verification)
+// ──────────────────────────────────────────────────────────────────────
+//
+// Server-to-server only: authenticated with your app's OAuth client id
+// and secret over HTTP Basic. No end user, no browser, no OIDC — this is
+// how an app that keeps its own auth verifies UseThatApp purchases.
+
+function licenseApiAuthHeader(): string {
+  const clientId = resolveClientId();
+  const secret = resolveClientSecret();
+  const token = Buffer.from(`${clientId}:${secret}`, "utf8").toString("base64");
+  return `Basic ${token}`;
+}
+
+function raiseForLicenseApiStatus(status: number, bodyText: string): void {
+  if (status >= 200 && status < 300) return;
+  const code = errorCode(bodyText);
+  if (status === 401) {
+    throw new UtaConfigError(
+      `client credentials rejected — check UTA_CLIENT_ID / UTA_CLIENT_SECRET: ${bodyText}`,
+    );
+  }
+  if (status === 404) {
+    throw new UtaNotFoundError(`${code || "not found"}: ${bodyText}`, code);
+  }
+  if (status === 409) {
+    throw new UtaLicenseCanceledError(
+      `license is canceled — its key cannot be regenerated: ${bodyText}`,
+    );
+  }
+  if (status === 400) throw new UtaError(`400 from license API: ${bodyText}`);
+  if (status === 429) {
+    throw new UtaServerError(`429 from license API — rate limited, retry with backoff: ${bodyText}`);
+  }
+  if (status >= 500 && status < 600) {
+    throw new UtaServerError(`${status} from license API: ${bodyText}`);
+  }
+  throw new UtaError(`unexpected status ${status} from license API: ${bodyText}`);
+}
+
+function parseLicenseState(obj: Record<string, unknown>): LicenseState {
+  return {
+    entitled: Boolean(obj.entitled),
+    status: typeof obj.status === "string" ? obj.status : "",
+    license_id: typeof obj.license_id === "string" ? obj.license_id : "",
+    product_public_id:
+      typeof obj.product_public_id === "string" ? obj.product_public_id : "",
+    period_end: typeof obj.period_end === "string" ? obj.period_end : null,
+    canceled_at: typeof obj.canceled_at === "string" ? obj.canceled_at : null,
+    license_key: typeof obj.license_key === "string" ? obj.license_key : null,
+    rotated_at: typeof obj.rotated_at === "string" ? obj.rotated_at : null,
+  };
+}
+
+async function licenseApiRequest(
+  method: string,
+  path: string,
+  body: unknown,
+  timeoutSeconds: number | undefined,
+): Promise<LicenseState> {
+  const url = resolveApiUrl() + path;
+  const timeout = timeoutSeconds ?? resolveRequestTimeoutSeconds();
+  // Resolve credentials BEFORE the try: a missing secret is a config
+  // error, and the catch below must wrap only genuine network failures.
+  const authorization = licenseApiAuthHeader();
+  let resp;
+  try {
+    resp = await fetchWithTimeout(
+      url,
+      {
+        method,
+        headers: {
+          Authorization: authorization,
+          ...(body !== undefined ? { "content-type": "application/json" } : {}),
+        },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      },
+      timeout,
+    );
+  } catch (e) {
+    throw new UtaServerError(`network error calling license API: ${errMessage(e)}`);
+  }
+  if (resp.status === 202) {
+    throw new UtaOrderProcessingError(
+      "order confirmed but its license hasn't landed yet — retry in a few seconds",
+    );
+  }
+  raiseForLicenseApiStatus(resp.status, resp.text);
+  let data: unknown;
+  try {
+    data = JSON.parse(resp.text);
+  } catch {
+    throw new UtaError("license API response is not valid JSON");
+  }
+  if (typeof data !== "object" || data === null) {
+    throw new UtaError("license API response is not a JSON object");
+  }
+  return parseLicenseState(data as Record<string, unknown>);
+}
+
+export interface LicenseApiOptions {
+  timeoutSeconds?: number;
+}
+
+/**
+ * The live state of a license key your user presented.
+ *
+ * Throws {@link UtaNotFoundError} (`code="unknown_key"`) for a key
+ * UseThatApp never issued for your app. A canceled purchase does NOT
+ * throw — it returns `entitled=false, status="canceled"`, because a key
+ * you once accepted deserves a lifecycle answer, not an error.
+ */
+export async function validateLicenseKey(
+  key: string,
+  opts: LicenseApiOptions = {},
+): Promise<LicenseState> {
+  if (!key) throw new UtaError("key must be a non-empty string");
+  return licenseApiRequest(
+    "POST", "/api/v1/licenses/validate", { key }, opts.timeoutSeconds,
+  );
+}
+
+/**
+ * Exchange the `uta_order` handback for the buyer's license key.
+ *
+ * `ref` arrives as the `uta_order` query parameter on your post-checkout
+ * return URL. The result carries `license_key` — link it to your own
+ * signed-in user and you never need email matching. Throws
+ * {@link UtaOrderProcessingError} when the payment cleared but the
+ * license hasn't landed yet (retry briefly), and {@link UtaNotFoundError}
+ * (`code="unknown_order"`) for a bad or expired ref.
+ */
+export async function getOrder(
+  ref: string,
+  opts: LicenseApiOptions = {},
+): Promise<LicenseState> {
+  if (!ref) throw new UtaError("ref must be a non-empty string");
+  return licenseApiRequest(
+    "GET", "/api/v1/orders/" + encodeURIComponent(ref), undefined,
+    opts.timeoutSeconds,
+  );
+}
+
+/**
+ * Mint a replacement key for one license; the old key dies now.
+ *
+ * The compromise kill switch — a merely-lost key is self-serve for the
+ * buyer on their UseThatApp management page, so reach for this only when
+ * a key must be revoked. The result's `license_key` is the new key;
+ * deliver it to your customer yourself. Throws {@link UtaNotFoundError}
+ * (`code="unknown_license"`) for a license that isn't your app's, and
+ * {@link UtaLicenseCanceledError} for a terminally canceled one.
+ */
+export async function regenerateLicenseKey(
+  licenseId: string,
+  opts: LicenseApiOptions = {},
+): Promise<LicenseState> {
+  if (!licenseId) throw new UtaError("licenseId must be a non-empty string");
+  return licenseApiRequest(
+    "POST",
+    `/api/v1/licenses/${encodeURIComponent(licenseId)}/regenerate-key`,
+    undefined,
+    opts.timeoutSeconds,
+  );
 }

@@ -130,6 +130,22 @@ export function resolveClientId(): string {
   return clientId;
 }
 
+/**
+ * The app's OAuth client secret (`UTA_CLIENT_SECRET` /
+ * `UTA_CLIENT_SECRET_PATH`), required — the License Key API is
+ * server-side only and authenticates with client credentials.
+ */
+export function resolveClientSecret(): string {
+  const secret = readSecretOrPath("UTA_CLIENT_SECRET", "UTA_CLIENT_SECRET_PATH");
+  if (!secret) {
+    throw new UtaConfigError(
+      "UTA_CLIENT_SECRET is required for the License Key API " +
+        "(server-side calls authenticate with your app's client credentials)",
+    );
+  }
+  return secret;
+}
+
 /** Per-request timeout in seconds (`UTA_REQUEST_TIMEOUT_SECONDS`, default 10). */
 export function resolveRequestTimeoutSeconds(): number {
   return readInt("UTA_REQUEST_TIMEOUT_SECONDS", 10, 1);
