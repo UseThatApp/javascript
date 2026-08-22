@@ -26,16 +26,9 @@ project adheres to [Semantic Versioning](https://semver.org/).
   same contract as the entitlement endpoint), with a parser fallback
   against servers that predate the cutover.
 
-## [2.1.0] - 2026-08-11
+## [2.1.0] and earlier
 
-The purchase surface: `purchaseUrl`, `manageUrl`, `getPrices`,
-`getAppInfo`, and `Entitlement.product_public_id`. Published to npm.
-
-## [2.0.0] - 2026-06-21
-
-OpenID Connect rewrite: `beginLogin`/`completeLogin`, `getEntitlement`,
-RP-initiated logout. Replaces the 1.x launch-envelope interface.
-
-## [1.0.0] - 2026-05-21
-
-Initial release: encrypted launch-envelope verification.
+Releases before 2.2.0 predate this changelog. 2.1.0 (on npm) added the
+purchase surface (`purchaseUrl`, `manageUrl`, `getPrices`,
+`getAppInfo`) and `Entitlement.product_public_id`; 2.0.0 was the
+OpenID Connect rewrite.
