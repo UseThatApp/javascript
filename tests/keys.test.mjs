@@ -147,3 +147,18 @@ test("empty inputs are rejected locally", async () => {
   await assert.rejects(getOrder(""), UtaError);
   await assert.rejects(regenerateLicenseKey(""), UtaError);
 });
+
+test("product_id is an equal-valued alias of product_public_id", async () => {
+  // Post-cutover pair — same contract as the entitlement endpoint.
+  routes["/api/v1/licenses/validate"] = () =>
+    json(200, { ...STATE, product_id: STATE.product_public_id });
+  const state = await validateLicenseKey("key_abc");
+  assert.equal(state.product_id, state.product_public_id);
+  assert.ok(state.product_id.startsWith("prod_"));
+});
+
+test("product_id falls back against a pre-cutover server", async () => {
+  routes["/api/v1/licenses/validate"] = () => json(200, STATE);
+  const state = await validateLicenseKey("key_abc");
+  assert.equal(state.product_id, STATE.product_public_id);
+});

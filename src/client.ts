@@ -663,6 +663,14 @@ function parseLicenseState(obj: Record<string, unknown>): LicenseState {
     license_id: typeof obj.license_id === "string" ? obj.license_id : "",
     product_public_id:
       typeof obj.product_public_id === "string" ? obj.product_public_id : "",
+    // Alias pair: fall back to product_public_id against a server that
+    // predates the identifier cutover.
+    product_id:
+      typeof obj.product_id === "string" && obj.product_id
+        ? obj.product_id
+        : typeof obj.product_public_id === "string"
+          ? obj.product_public_id
+          : "",
     period_end: typeof obj.period_end === "string" ? obj.period_end : null,
     canceled_at: typeof obj.canceled_at === "string" ? obj.canceled_at : null,
     license_key: typeof obj.license_key === "string" ? obj.license_key : null,
