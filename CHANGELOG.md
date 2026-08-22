@@ -26,6 +26,16 @@ project adheres to [Semantic Versioning](https://semver.org/).
   same contract as the entitlement endpoint), with a parser fallback
   against servers that predate the cutover.
 
+### Fixed
+
+- The `UtaServiceNotEnabledError` message named the add-on by its
+  retired public name ("Auth & Entitlement") and hardcoded
+  `usethatapp.com`; it now says "Hosted sign-in" and points at the
+  configured `UTA_API_URL` host.
+- Non-JSON error bodies (HTML error pages) are collapsed and capped at
+  ~200 characters when quoted into error messages, instead of inlining
+  the entire page.
+
 ## [2.1.0] and earlier
 
 Releases before 2.2.0 predate this changelog. 2.1.0 (on npm) added the

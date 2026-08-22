@@ -465,10 +465,10 @@ function sessionFromToken(
 function raiseForEntitlementStatus(status: number, bodyText: string): void {
   if (status >= 200 && status < 300) return;
   if (status === 400) {
-    throw new UtaError(`400 from entitlement (client not linked to an app?): ${bodyText}`);
+    throw new UtaError(`400 from entitlement (client not linked to an app?): ${snippet(bodyText)}`);
   }
   if (status === 401) {
-    throw new UtaTokenError(`401 from entitlement — access token invalid/expired: ${bodyText}`);
+    throw new UtaTokenError(`401 from entitlement — access token invalid/expired: ${snippet(bodyText)}`);
   }
   if (status === 403) {
     // Two distinct 403s (see the server's EntitlementView contract):
@@ -476,20 +476,40 @@ function raiseForEntitlementStatus(status: number, bodyText: string): void {
     // (the developer must enable the add-on — nothing here will fix it).
     if (errorCode(bodyText) === "service_not_enabled") {
       throw new UtaServiceNotEnabledError(
-        "403 from entitlement — the entitlement service is not enabled " +
-        "for this app. Enable the Auth & Entitlement add-on on the " +
-        `app's manage page at usethatapp.com (Integration panel): ${bodyText}`,
+        "403 from entitlement — Hosted sign-in is not enabled for this " +
+        "app. The developer can turn on the Hosted sign-in add-on from " +
+        `the app's manage hub at ${resolveApiUrl()} (Integration panel): ` +
+        snippet(bodyText),
       );
     }
-    throw new UtaPermissionError(`403 from entitlement — missing 'entitlements' scope: ${bodyText}`);
+    throw new UtaPermissionError(`403 from entitlement — missing 'entitlements' scope: ${snippet(bodyText)}`);
   }
   if (status === 429) {
-    throw new UtaServerError(`429 from entitlement — rate limited, retry with backoff: ${bodyText}`);
+    throw new UtaServerError(`429 from entitlement — rate limited, retry with backoff: ${snippet(bodyText)}`);
   }
   if (status >= 500 && status < 600) {
-    throw new UtaServerError(`${status} from entitlement: ${bodyText}`);
+    throw new UtaServerError(`${status} from entitlement: ${snippet(bodyText)}`);
   }
-  throw new UtaError(`unexpected status ${status} from entitlement: ${bodyText}`);
+  throw new UtaError(`unexpected status ${status} from entitlement: ${snippet(bodyText)}`);
+}
+
+/**
+ * Error bodies get quoted into exception messages. A JSON error body is
+ * short and worth quoting whole; a non-JSON body (an HTML error page — a
+ * proxy's, or a server debug page) is kilobytes of markup that bury the
+ * message, so quote only its head.
+ */
+function snippet(bodyText: string, limit = 200): string {
+  const text = bodyText.trim();
+  try {
+    JSON.parse(text);
+    return text;
+  } catch {
+    // not JSON — fall through to collapse + cap
+  }
+  const collapsed = text.split(/\s+/).join(" ");
+  if (collapsed.length <= limit) return collapsed;
+  return collapsed.slice(0, limit) + `… [${bodyText.length} bytes truncated]`;
 }
 
 /**
@@ -564,16 +584,16 @@ function raiseForPublicApiStatus(status: number, what: string, bodyText: string)
   if (status >= 200 && status < 300) return;
   if (status === 404) {
     throw new UtaError(
-      `404 from ${what} — app unknown, unpublished, or external sales not enabled: ${bodyText}`,
+      `404 from ${what} — app unknown, unpublished, or external sales not enabled: ${snippet(bodyText)}`,
     );
   }
   if (status === 429) {
-    throw new UtaServerError(`429 from ${what} — rate limited, retry with backoff: ${bodyText}`);
+    throw new UtaServerError(`429 from ${what} — rate limited, retry with backoff: ${snippet(bodyText)}`);
   }
   if (status >= 500 && status < 600) {
-    throw new UtaServerError(`${status} from ${what}: ${bodyText}`);
+    throw new UtaServerError(`${status} from ${what}: ${snippet(bodyText)}`);
   }
-  throw new UtaError(`unexpected status ${status} from ${what}: ${bodyText}`);
+  throw new UtaError(`unexpected status ${status} from ${what}: ${snippet(bodyText)}`);
 }
 
 function parseAppInfo(obj: Record<string, unknown>): AppInfo {
@@ -635,25 +655,25 @@ function raiseForLicenseApiStatus(status: number, bodyText: string): void {
   const code = errorCode(bodyText);
   if (status === 401) {
     throw new UtaConfigError(
-      `client credentials rejected — check UTA_CLIENT_ID / UTA_CLIENT_SECRET: ${bodyText}`,
+      `client credentials rejected — check UTA_CLIENT_ID / UTA_CLIENT_SECRET: ${snippet(bodyText)}`,
     );
   }
   if (status === 404) {
-    throw new UtaNotFoundError(`${code || "not found"}: ${bodyText}`, code);
+    throw new UtaNotFoundError(`${code || "not found"}: ${snippet(bodyText)}`, code);
   }
   if (status === 409) {
     throw new UtaLicenseCanceledError(
-      `license is canceled — its key cannot be regenerated: ${bodyText}`,
+      `license is canceled — its key cannot be regenerated: ${snippet(bodyText)}`,
     );
   }
-  if (status === 400) throw new UtaError(`400 from license API: ${bodyText}`);
+  if (status === 400) throw new UtaError(`400 from license API: ${snippet(bodyText)}`);
   if (status === 429) {
-    throw new UtaServerError(`429 from license API — rate limited, retry with backoff: ${bodyText}`);
+    throw new UtaServerError(`429 from license API — rate limited, retry with backoff: ${snippet(bodyText)}`);
   }
   if (status >= 500 && status < 600) {
-    throw new UtaServerError(`${status} from license API: ${bodyText}`);
+    throw new UtaServerError(`${status} from license API: ${snippet(bodyText)}`);
   }
-  throw new UtaError(`unexpected status ${status} from license API: ${bodyText}`);
+  throw new UtaError(`unexpected status ${status} from license API: ${snippet(bodyText)}`);
 }
 
 function parseLicenseState(obj: Record<string, unknown>): LicenseState {

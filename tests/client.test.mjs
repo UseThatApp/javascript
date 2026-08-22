@@ -258,7 +258,25 @@ test("getEntitlement maps 403 service_not_enabled to its own error", async () =>
   });
   await assert.rejects(getEntitlement("at-123"), UtaServiceNotEnabledError);
   await assert.rejects(getEntitlement("at-123"), UtaPermissionError);
-  await assert.rejects(getEntitlement("at-123"), /manage page/);
+  // Glassbox F-10: the message names the CURRENT public feature name and
+  // points at the configured host, never a hardcoded usethatapp.com.
+  await assert.rejects(getEntitlement("at-123"), /Hosted sign-in/);
+  await assert.rejects(getEntitlement("at-123"), (err) => {
+    assert.ok(!String(err.message).includes("Auth & Entitlement"));
+    assert.ok(String(err.message).includes(API_URL));
+    return true;
+  });
+});
+
+test("non-JSON error bodies are collapsed and capped (Glassbox F-11)", async () => {
+  const htmlPage = "<!DOCTYPE html><html>" + "x".repeat(5000) + "</html>";
+  routes.entitlement = () => json(500, htmlPage, { "content-type": "text/html" });
+  await assert.rejects(getEntitlement("at-123"), (err) => {
+    assert.ok(err instanceof UtaServerError);
+    assert.ok(String(err.message).length < 400, `message too long: ${err.message.length}`);
+    assert.ok(String(err.message).includes("truncated"));
+    return true;
+  });
 });
 
 test("getEntitlement keeps the exact class for a scope 403", async () => {
