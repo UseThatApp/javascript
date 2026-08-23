@@ -25,6 +25,7 @@ import {
   UtaServiceNotEnabledError,
   UtaServerError,
   UtaTokenError,
+  SDK_VERSION,
 } from "../dist/index.js";
 
 const ISSUER = "https://oidc.test.example/o";
@@ -348,4 +349,44 @@ test("logoutUrl builds the end-session URL", async () => {
   assert.equal(url.searchParams.get("id_token_hint"), "idt");
   assert.equal(url.searchParams.get("post_logout_redirect_uri"), "https://app.test.example/bye");
   assert.equal(url.searchParams.get("client_id"), CLIENT_ID);
+});
+
+// ── Quiver audit fixes (J-05, J-08, J-12) ──────────────────────────────
+
+test("configure() rejects unknown option names (J-08, Python parity)", () => {
+  assert.throws(
+    () => configure({ api_ur: "http://typo.example" }),
+    (err) => {
+      assert.ok(err instanceof UtaConfigError);
+      assert.match(err.message, /unknown configure\(\) option/);
+      assert.match(err.message, /api_ur/);
+      return true;
+    },
+  );
+  // The typo must not have been stored either.
+  configure({ api_url: "https://kept.example" });
+});
+
+test("a 429 surfaces Retry-After on UtaServerError (J-05)", async () => {
+  routes.entitlement = () => json(429, { error: "rate_limited" }, { "retry-after": "60" });
+  await assert.rejects(getEntitlement("at-123"), (err) => {
+    assert.ok(err instanceof UtaServerError);
+    assert.equal(err.retryAfter, 60);
+    return true;
+  });
+});
+
+test("retryAfter is null when the server sends none (J-05)", async () => {
+  routes.entitlement = () => json(503, "unavailable");
+  await assert.rejects(getEntitlement("at-123"), (err) => {
+    assert.ok(err instanceof UtaServerError);
+    assert.equal(err.retryAfter, null);
+    return true;
+  });
+});
+
+test("SDK_VERSION is exported and matches package.json (J-12)", async () => {
+  const { readFileSync } = await import("node:fs");
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(SDK_VERSION, pkg.version);
 });

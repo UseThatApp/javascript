@@ -347,10 +347,10 @@ export interface GetPricesOptions {
  * Fetch your app's public price list. Anonymous — no Authorization header
  * is sent, so no login is needed. Render your pricing from this API instead
  * of hardcoding amounts. Each price's `product_id` is the opaque `prod_…`
- * identifier to gate on — compare it against
- * {@link Entitlement.product_public_id} (`Entitlement.product_id` still
- * carries the legacy UUID until the platform's identifier cutover). Each
- * `buy_url` is the ready-made hosted checkout link.
+ * identifier to gate on — compare it against {@link Entitlement.product_id}
+ * or {@link Entitlement.product_public_id}: since the platform's identifier
+ * cutover they are a permanent equal-valued alias pair, so either works.
+ * Each `buy_url` is the ready-made hosted checkout link.
  */
 export async function getPrices(opts: GetPricesOptions = {}): Promise<AppPrices> {
   const url = resolveApiUrl() + PUBLIC_APPS_PATH + encodeURIComponent(resolveClientId()) + "/prices/";
@@ -462,7 +462,7 @@ function sessionFromToken(
   };
 }
 
-function raiseForEntitlementStatus(status: number, bodyText: string): void {
+function raiseForEntitlementStatus(status: number, bodyText: string, retryAfter: number | null = null): void {
   if (status >= 200 && status < 300) return;
   if (status === 400) {
     throw new UtaError(`400 from entitlement (client not linked to an app?): ${snippet(bodyText)}`);
@@ -485,10 +485,10 @@ function raiseForEntitlementStatus(status: number, bodyText: string): void {
     throw new UtaPermissionError(`403 from entitlement — missing 'entitlements' scope: ${snippet(bodyText)}`);
   }
   if (status === 429) {
-    throw new UtaServerError(`429 from entitlement — rate limited, retry with backoff: ${snippet(bodyText)}`);
+    throw new UtaServerError(`429 from entitlement — rate limited, retry with backoff: ${snippet(bodyText)}`, retryAfter);
   }
   if (status >= 500 && status < 600) {
-    throw new UtaServerError(`${status} from entitlement: ${snippet(bodyText)}`);
+    throw new UtaServerError(`${status} from entitlement: ${snippet(bodyText)}`, retryAfter);
   }
   throw new UtaError(`unexpected status ${status} from entitlement: ${snippet(bodyText)}`);
 }
@@ -548,7 +548,7 @@ async function apiGetJson(
   what: string,
   timeoutSeconds: number,
   headers: Record<string, string>,
-  raiseForStatus: (status: number, bodyText: string) => void,
+  raiseForStatus: (status: number, bodyText: string, retryAfter: number | null) => void,
 ): Promise<Record<string, unknown>> {
   let resp: TimedResponse;
   try {
@@ -556,7 +556,7 @@ async function apiGetJson(
   } catch (e) {
     throw new UtaServerError(`network error calling ${what}: ${errMessage(e)}`);
   }
-  raiseForStatus(resp.status, resp.text);
+  raiseForStatus(resp.status, resp.text, resp.retryAfter);
   let data: unknown;
   try {
     data = JSON.parse(resp.text);
@@ -575,12 +575,12 @@ function publicApiGet(
   what: string,
   timeoutSeconds: number,
 ): Promise<Record<string, unknown>> {
-  return apiGetJson(url, what, timeoutSeconds, {}, (status, bodyText) =>
-    raiseForPublicApiStatus(status, what, bodyText),
+  return apiGetJson(url, what, timeoutSeconds, {}, (status, bodyText, retryAfter) =>
+    raiseForPublicApiStatus(status, what, bodyText, retryAfter),
   );
 }
 
-function raiseForPublicApiStatus(status: number, what: string, bodyText: string): void {
+function raiseForPublicApiStatus(status: number, what: string, bodyText: string, retryAfter: number | null = null): void {
   if (status >= 200 && status < 300) return;
   if (status === 404) {
     throw new UtaError(
@@ -588,10 +588,10 @@ function raiseForPublicApiStatus(status: number, what: string, bodyText: string)
     );
   }
   if (status === 429) {
-    throw new UtaServerError(`429 from ${what} — rate limited, retry with backoff: ${snippet(bodyText)}`);
+    throw new UtaServerError(`429 from ${what} — rate limited, retry with backoff: ${snippet(bodyText)}`, retryAfter);
   }
   if (status >= 500 && status < 600) {
-    throw new UtaServerError(`${status} from ${what}: ${snippet(bodyText)}`);
+    throw new UtaServerError(`${status} from ${what}: ${snippet(bodyText)}`, retryAfter);
   }
   throw new UtaError(`unexpected status ${status} from ${what}: ${snippet(bodyText)}`);
 }
@@ -650,7 +650,7 @@ function licenseApiAuthHeader(): string {
   return `Basic ${token}`;
 }
 
-function raiseForLicenseApiStatus(status: number, bodyText: string): void {
+function raiseForLicenseApiStatus(status: number, bodyText: string, retryAfter: number | null = null): void {
   if (status >= 200 && status < 300) return;
   const code = errorCode(bodyText);
   if (status === 401) {
@@ -668,10 +668,10 @@ function raiseForLicenseApiStatus(status: number, bodyText: string): void {
   }
   if (status === 400) throw new UtaError(`400 from license API: ${snippet(bodyText)}`);
   if (status === 429) {
-    throw new UtaServerError(`429 from license API — rate limited, retry with backoff: ${snippet(bodyText)}`);
+    throw new UtaServerError(`429 from license API — rate limited, retry with backoff: ${snippet(bodyText)}`, retryAfter);
   }
   if (status >= 500 && status < 600) {
-    throw new UtaServerError(`${status} from license API: ${snippet(bodyText)}`);
+    throw new UtaServerError(`${status} from license API: ${snippet(bodyText)}`, retryAfter);
   }
   throw new UtaError(`unexpected status ${status} from license API: ${snippet(bodyText)}`);
 }
@@ -731,7 +731,7 @@ async function licenseApiRequest(
       "order confirmed but its license hasn't landed yet — retry in a few seconds",
     );
   }
-  raiseForLicenseApiStatus(resp.status, resp.text);
+  raiseForLicenseApiStatus(resp.status, resp.text, resp.retryAfter);
   let data: unknown;
   try {
     data = JSON.parse(resp.text);

@@ -36,6 +36,8 @@ export {
 
 export { resetDiscoveryCache, type OidcMetadata } from "./discovery.js";
 
+export { SDK_VERSION } from "./version.js";
+
 export {
   UtaAuthError,
   UtaConfigError,

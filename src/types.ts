@@ -130,19 +130,19 @@ export interface Entitlement {
  * own cadence.
  */
 export interface LicenseState {
-  entitled: boolean;
-  status: string;
-  license_id: string;
+  readonly entitled: boolean;
+  readonly status: string;
+  readonly license_id: string;
   /**
    * The opaque `prod_…` product identifier. `product_id` and
    * `product_public_id` are equal-valued aliases (a permanent pair since
    * the platform's identifier cutover), matching the entitlement
    * endpoint — gate on either field.
    */
-  product_id: string;
-  product_public_id: string;
-  period_end: string | null;
-  canceled_at: string | null;
-  license_key: string | null;
-  rotated_at: string | null;
+  readonly product_id: string;
+  readonly product_public_id: string;
+  readonly period_end: string | null;
+  readonly canceled_at: string | null;
+  readonly license_key: string | null;
+  readonly rotated_at: string | null;
 }

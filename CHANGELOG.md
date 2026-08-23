@@ -26,8 +26,26 @@ project adheres to [Semantic Versioning](https://semver.org/).
   same contract as the entitlement endpoint), with a parser fallback
   against servers that predate the cutover.
 
+- `UtaServerError.retryAfter` — the server's `Retry-After` header in
+  seconds on a 429 (`null` otherwise), so backoff loops can use the
+  interval the platform actually sent instead of guessing.
+- `SDK_VERSION` — the installed version as a string, for build checks,
+  log lines, and bug reports; the `exports` map also now exposes
+  `./package.json` for tooling.
+
 ### Fixed
 
+- `configure()` now throws `UtaConfigError` on an unknown option name,
+  matching the Python SDK. TypeScript's excess-property check only
+  guards object literals, so a typo from plain JavaScript (every
+  framework sample on the docs site) was silently ignored — and the
+  setting it was meant to change kept its default, e.g. `api_url`
+  still pointing at production.
+- `LicenseState` fields are `readonly`, matching every other public
+  interface.
+- The `getPrices` JSDoc claimed `Entitlement.product_id` still carried
+  a legacy UUID "until the platform's identifier cutover"; the cutover
+  shipped, and the type's own doc said so — the two tooltips now agree.
 - The `UtaServiceNotEnabledError` message named the add-on by its
   retired public name ("Auth & Entitlement") and hardcoded
   `usethatapp.com`; it now says "Hosted sign-in" and points at the

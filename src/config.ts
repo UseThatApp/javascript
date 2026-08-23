@@ -94,11 +94,33 @@ function readInt(name: string, fallback: number, min: number): number {
   return n;
 }
 
+const ALLOWED_OVERRIDES = new Set([
+  "client_id",
+  "client_secret",
+  "client_secret_path",
+  "redirect_uri",
+  "issuer",
+  "api_url",
+  "scopes",
+  "request_timeout_seconds",
+  "clock_skew_seconds",
+]);
+
 /**
  * Override one or more settings at runtime (useful for tests or apps that
  * prefer programmatic configuration over env vars). Clears the cached config.
+ *
+ * Unknown option names throw {@link UtaConfigError}, matching the Python
+ * SDK: TypeScript's excess-property check only guards object literals, so
+ * without this a typo from plain JavaScript (or a config object assembled
+ * elsewhere) was silently ignored — and the setting it was meant to change
+ * kept its default, e.g. api_url pointing at production (Quiver J-08).
  */
 export function configure(overrides: UtaConfigOverrides): void {
+  const unknown = Object.keys(overrides).filter((k) => !ALLOWED_OVERRIDES.has(k));
+  if (unknown.length > 0) {
+    throw new UtaConfigError(`unknown configure() option(s): ${unknown.sort().join(", ")}`);
+  }
   _overrides = { ..._overrides, ...overrides };
   _cached = null;
 }

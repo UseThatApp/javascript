@@ -72,5 +72,17 @@ export class UtaOrderProcessingError extends UtaError {}
 /** The license is terminally canceled — its key cannot be regenerated. */
 export class UtaLicenseCanceledError extends UtaError {}
 
-/** A usethatapp.com endpoint returned 5xx, or the network failed. Retriable. */
-export class UtaServerError extends UtaError {}
+/**
+ * A usethatapp.com endpoint returned 5xx or 429, or the network failed.
+ * Retriable. On a rate limit (429), `retryAfter` carries the server's
+ * `Retry-After` header in seconds — use it as the backoff interval instead
+ * of guessing. `null` when the server sent none (5xx, network errors).
+ */
+export class UtaServerError extends UtaError {
+  readonly retryAfter: number | null;
+
+  constructor(message: string, retryAfter: number | null = null) {
+    super(message);
+    this.retryAfter = retryAfter;
+  }
+}
