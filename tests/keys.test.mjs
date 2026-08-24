@@ -162,3 +162,32 @@ test("product_id falls back against a pre-cutover server", async () => {
   const state = await validateLicenseKey("key_abc");
   assert.equal(state.product_id, STATE.product_public_id);
 });
+
+// ── Pre-release code-review regressions ──────────────────────────────
+
+test("a JSON array response throws instead of decoding to defaults (finding 4)", async () => {
+  // The old hand-rolled decode lacked the Array.isArray rejection:
+  // typeof [] === "object", every per-field guard fell through, and
+  // validateLicenseKey returned {entitled: false} — a silent
+  // entitlement denial instead of a loud contract error.
+  routes["/api/v1/licenses/validate"] = () => json(200, [STATE]);
+  await assert.rejects(validateLicenseKey("key_x"), (err) => {
+    assert.ok(err instanceof UtaError);
+    assert.ok(/not a JSON object/.test(err.message));
+    return true;
+  });
+});
+
+test("202 semantics belong to getOrder alone (finding 9)", async () => {
+  // getOrder: 202 = payment cleared, license pending — retriable.
+  routes["/api/v1/orders/"] = () => json(202, {});
+  await assert.rejects(getOrder("ref-1"), UtaOrderProcessingError);
+  // validateLicenseKey: a 202 is off-contract — the order-specific
+  // "retry in a few seconds" message must not steer retry loops here.
+  routes["/api/v1/licenses/validate"] = () => json(202, {});
+  await assert.rejects(validateLicenseKey("key_x"), (err) => {
+    assert.ok(!(err instanceof UtaOrderProcessingError));
+    assert.ok(/unexpected status 202/.test(err.message));
+    return true;
+  });
+});

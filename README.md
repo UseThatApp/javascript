@@ -115,10 +115,10 @@ nothing framework-specific ships in the package.
 |--------|----------------------|------------------------------------------------|
 | 401    | `UtaTokenError`      | Access token invalid/expired — re-auth/refresh.|
 | 403 (`insufficient_scope`)  | `UtaPermissionError`        | Token lacks the `entitlements` scope. |
-| 403 (`service_not_enabled`) | `UtaServiceNotEnabledError` | The Auth & Entitlement add-on is switched off for this app. No retry, refresh, or re-consent will help — enable it on the app's manage page at usethatapp.com (Integration panel). |
+| 403 (`service_not_enabled`) | `UtaServiceNotEnabledError` | The Hosted sign-in add-on is switched off for this app. No retry, refresh, or re-consent will help — enable it on the app's manage page at www.usethatapp.com (Integration panel). |
 | 400    | `UtaError`           | Client not linked to an app (misconfig).       |
-| 429    | `UtaServerError`     | Rate limited — retriable with backoff.         |
-| 5xx    | `UtaServerError`     | Retriable with backoff.                        |
+| 429    | `UtaServerError`     | Rate limited — back off; `e.retryAfter` carries the server's `Retry-After` seconds (or `null`). |
+| 5xx    | `UtaServerError`     | Retriable with backoff; `e.retryAfter` when the server sent one. |
 
 All inherit from `UtaError` — catch that for a single `catch` clause.
 `UtaServiceNotEnabledError` extends `UtaPermissionError`, so existing
@@ -244,7 +244,7 @@ npm test        # build + node:test suite
 
 ## Changelog
 
-### Unreleased
+### 2.2.0 (2026-08-23)
 
 **Added**
 
@@ -252,14 +252,14 @@ npm test        # build + node:test suite
   verification): `validateLicenseKey(key)`, `getOrder(ref)` for the
   `uta_order` checkout handback, and `regenerateLicenseKey(licenseId)`
   as the compromise kill switch — all authenticated with your app's
-  client credentials via the new `resolveClientSecret()` partial
-  resolver (no OIDC config needed). New `LicenseState` type and typed
-  errors: `UtaNotFoundError` (with `.code`), `UtaOrderProcessingError`,
-  `UtaLicenseCanceledError`.
+  client credentials, read from `UTA_CLIENT_SECRET` (or the file at
+  `UTA_CLIENT_SECRET_PATH`) with no OIDC config needed. New
+  `LicenseState` type and typed errors: `UtaNotFoundError` (with
+  `.code`), `UtaOrderProcessingError`, `UtaLicenseCanceledError`.
 
 - `UtaServiceNotEnabledError` (extends `UtaPermissionError`), thrown when
   the entitlement endpoint returns `403 service_not_enabled`: the app's
-  developer has not enabled the Auth & Entitlement add-on. Previously
+  developer has not enabled the Hosted sign-in add-on. Previously
   every entitlement 403 was labeled a missing `entitlements` scope; the
   new error names the actual fix (enable the add-on on the app's manage
   page). Existing `catch` blocks for `UtaPermissionError` match it

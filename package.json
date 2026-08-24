@@ -1,7 +1,7 @@
 {
   "name": "usethatapp",
   "version": "2.2.0",
-  "description": "JavaScript/TypeScript SDK for usethatapp.com — OpenID Connect login and live license entitlement queries.",
+  "description": "JavaScript/TypeScript SDK for usethatapp.com \u2014 OpenID Connect login and live license entitlement queries.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -34,7 +34,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/gen-version.mjs && tsc",
     "prepublishOnly": "npm run build",
     "test": "npm run build && node --test"
   },

@@ -16,6 +16,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { jwtVerify } from "jose";
 
 import {
+  DEFAULT_API_URL,
   loadConfig,
   resolveApiUrl,
   resolveClientId,
@@ -204,10 +205,22 @@ export async function userinfo(accessToken: string): Promise<Record<string, unkn
   } catch (e) {
     throw new UtaServerError(`network error calling userinfo: ${errMessage(e)}`);
   }
-  if (resp.status === 401) throw new UtaTokenError(`401 from userinfo: ${resp.text}`);
-  if (resp.status === 403) throw new UtaPermissionError(`403 from userinfo: ${resp.text}`);
-  if (resp.status >= 500) throw new UtaServerError(`${resp.status} from userinfo`);
-  if (!resp.ok) throw new UtaError(`unexpected status ${resp.status} from userinfo: ${resp.text}`);
+  if (resp.status === 401) throw new UtaTokenError(`401 from userinfo: ${snippet(resp.text)}`);
+  if (resp.status === 403) throw new UtaPermissionError(`403 from userinfo: ${snippet(resp.text)}`);
+  // Same 429/5xx contract as every other endpoint (review finding 2):
+  // the backoff loop this release invites — catch UtaServerError, sleep
+  // e.retryAfter — must work when the SAME rate limiter throttles
+  // userinfo during login.
+  if (resp.status === 429) {
+    throw new UtaServerError(
+      `429 from userinfo — rate limited, retry with backoff: ${snippet(resp.text)}`,
+      resp.retryAfter,
+    );
+  }
+  if (resp.status >= 500) {
+    throw new UtaServerError(`${resp.status} from userinfo: ${snippet(resp.text)}`, resp.retryAfter);
+  }
+  if (!resp.ok) throw new UtaError(`unexpected status ${resp.status} from userinfo: ${snippet(resp.text)}`);
   try {
     return JSON.parse(resp.text) as Record<string, unknown>;
   } catch (e) {
@@ -375,8 +388,7 @@ async function tokenRequest(
   // Confidential clients use HTTP Basic (client_secret_basic); public
   // clients send client_id in the body and rely on PKCE.
   if (cfg.client_secret) {
-    headers.Authorization =
-      "Basic " + Buffer.from(`${cfg.client_id}:${cfg.client_secret}`).toString("base64");
+    headers.Authorization = basicAuth(cfg.client_id, cfg.client_secret);
   } else {
     body.set("client_id", cfg.client_id);
   }
@@ -392,8 +404,17 @@ async function tokenRequest(
     throw new UtaServerError(`network error calling token endpoint: ${errMessage(e)}`);
   }
   const text = resp.text;
+  // A throttled token refresh is retriable server pushback, not a
+  // credential failure — it must NOT surface as UtaTokenError, which
+  // callers treat as "log the user out" (review finding 2).
+  if (resp.status === 429) {
+    throw new UtaServerError(
+      `429 from token endpoint — rate limited, retry with backoff: ${snippet(text)}`,
+      resp.retryAfter,
+    );
+  }
   if (resp.status >= 500) {
-    throw new UtaServerError(`${resp.status} from token endpoint: ${text}`);
+    throw new UtaServerError(`${resp.status} from token endpoint: ${snippet(text)}`, resp.retryAfter);
   }
   let payload: Record<string, unknown>;
   try {
@@ -475,10 +496,14 @@ function raiseForEntitlementStatus(status: number, bodyText: string, retryAfter:
     // insufficient_scope (fix the requested scopes) vs service_not_enabled
     // (the developer must enable the add-on — nothing here will fix it).
     if (errorCode(bodyText) === "service_not_enabled") {
+      // The manage hub lives on the production dashboard host — NEVER
+      // the resolved api_url, which configure({api_url}) can point at a
+      // dev stack or gateway with no manage UI (Python review finding
+      // 10; same bug here).
       throw new UtaServiceNotEnabledError(
         "403 from entitlement — Hosted sign-in is not enabled for this " +
         "app. The developer can turn on the Hosted sign-in add-on from " +
-        `the app's manage hub at ${resolveApiUrl()} (Integration panel): ` +
+        `the app's manage page on ${DEFAULT_API_URL} (Integration panel): ` +
         snippet(bodyText),
       );
     }
@@ -494,22 +519,17 @@ function raiseForEntitlementStatus(status: number, bodyText: string, retryAfter:
 }
 
 /**
- * Error bodies get quoted into exception messages. A JSON error body is
- * short and worth quoting whole; a non-JSON body (an HTML error page — a
- * proxy's, or a server debug page) is kilobytes of markup that bury the
- * message, so quote only its head.
+ * Error bodies get quoted into exception messages: collapsed to one line
+ * and capped at `limit` characters — uniformly. JSON gets no exemption: a
+ * gateway error with an embedded multi-KB traceback field parses as JSON
+ * and is exactly the log-flooding this cap exists to stop (review
+ * finding 3 — the old code returned anything JSON.parse accepted whole,
+ * and paid a throwaway parse to do it).
  */
 function snippet(bodyText: string, limit = 200): string {
-  const text = bodyText.trim();
-  try {
-    JSON.parse(text);
-    return text;
-  } catch {
-    // not JSON — fall through to collapse + cap
-  }
-  const collapsed = text.split(/\s+/).join(" ");
+  const collapsed = bodyText.trim().split(/\s+/).join(" ");
   if (collapsed.length <= limit) return collapsed;
-  return collapsed.slice(0, limit) + `… [${bodyText.length} bytes truncated]`;
+  return collapsed.slice(0, limit) + `… [${collapsed.length - limit} more chars truncated]`;
 }
 
 /**
@@ -532,7 +552,16 @@ function parseEntitlement(obj: Record<string, unknown>): Entitlement {
   return {
     entitled: Boolean(obj.entitled),
     version: typeof obj.version === "string" ? obj.version : null,
-    product_id: typeof obj.product_id === "string" ? obj.product_id : null,
+    // Alias pair: fall back to product_public_id against a server that
+    // predates the identifier cutover — the same fallback
+    // parseLicenseState carries, so the types.ts promise ("either
+    // works") holds in BOTH verification modes (review finding 1).
+    product_id:
+      typeof obj.product_id === "string" && obj.product_id
+        ? obj.product_id
+        : typeof obj.product_public_id === "string"
+          ? obj.product_public_id
+          : null,
     product_public_id:
       typeof obj.product_public_id === "string" ? obj.product_public_id : null,
     status: typeof obj.status === "string" ? obj.status : "none",
@@ -557,9 +586,20 @@ async function apiGetJson(
     throw new UtaServerError(`network error calling ${what}: ${errMessage(e)}`);
   }
   raiseForStatus(resp.status, resp.text, resp.retryAfter);
+  return decodeJsonObject(resp.text, what);
+}
+
+/**
+ * Decode a response body into a JSON object, rejecting non-objects AND
+ * arrays. Shared by apiGetJson and licenseApiRequest — the two used to
+ * hand-roll this and drifted: the license path lacked the Array.isArray
+ * rejection, so a JSON array silently decoded into an all-defaults
+ * LicenseState — a silent entitlement denial (review finding 4).
+ */
+function decodeJsonObject(text: string, what: string): Record<string, unknown> {
   let data: unknown;
   try {
-    data = JSON.parse(resp.text);
+    data = JSON.parse(text);
   } catch (e) {
     throw new UtaError(`${what} response is not valid JSON: ${errMessage(e)}`);
   }
@@ -643,11 +683,14 @@ function parsePrices(obj: Record<string, unknown>): AppPrices {
 // and secret over HTTP Basic. No end user, no browser, no OIDC — this is
 // how an app that keeps its own auth verifies UseThatApp purchases.
 
+/** HTTP Basic credentials header — shared by the token endpoint and the
+ * License Key API (was duplicated; review cut-list). */
+function basicAuth(clientId: string, secret: string): string {
+  return "Basic " + Buffer.from(`${clientId}:${secret}`, "utf8").toString("base64");
+}
+
 function licenseApiAuthHeader(): string {
-  const clientId = resolveClientId();
-  const secret = resolveClientSecret();
-  const token = Buffer.from(`${clientId}:${secret}`, "utf8").toString("base64");
-  return `Basic ${token}`;
+  return basicAuth(resolveClientId(), resolveClientSecret());
 }
 
 function raiseForLicenseApiStatus(status: number, bodyText: string, retryAfter: number | null = null): void {
@@ -703,6 +746,7 @@ async function licenseApiRequest(
   path: string,
   body: unknown,
   timeoutSeconds: number | undefined,
+  orderProcessingOn202 = false,
 ): Promise<LicenseState> {
   const url = resolveApiUrl() + path;
   const timeout = timeoutSeconds ?? resolveRequestTimeoutSeconds();
@@ -727,21 +771,19 @@ async function licenseApiRequest(
     throw new UtaServerError(`network error calling license API: ${errMessage(e)}`);
   }
   if (resp.status === 202) {
-    throw new UtaOrderProcessingError(
-      "order confirmed but its license hasn't landed yet — retry in a few seconds",
-    );
+    // 202 is the ORDER endpoint's "payment cleared, license pending"
+    // signal — only getOrder opts into it. Anywhere else it is
+    // off-contract, and the order-specific retry message would steer
+    // retry loops at the wrong endpoint (review finding 9).
+    if (orderProcessingOn202) {
+      throw new UtaOrderProcessingError(
+        "order confirmed but its license hasn't landed yet — retry in a few seconds",
+      );
+    }
+    throw new UtaError(`unexpected status 202 from license API: ${snippet(resp.text)}`);
   }
   raiseForLicenseApiStatus(resp.status, resp.text, resp.retryAfter);
-  let data: unknown;
-  try {
-    data = JSON.parse(resp.text);
-  } catch {
-    throw new UtaError("license API response is not valid JSON");
-  }
-  if (typeof data !== "object" || data === null) {
-    throw new UtaError("license API response is not a JSON object");
-  }
-  return parseLicenseState(data as Record<string, unknown>);
+  return parseLicenseState(decodeJsonObject(resp.text, "license API"));
 }
 
 export interface LicenseApiOptions {
@@ -783,7 +825,7 @@ export async function getOrder(
   if (!ref) throw new UtaError("ref must be a non-empty string");
   return licenseApiRequest(
     "GET", "/api/v1/orders/" + encodeURIComponent(ref), undefined,
-    opts.timeoutSeconds,
+    opts.timeoutSeconds, /* orderProcessingOn202 */ true,
   );
 }
 

@@ -7,6 +7,45 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [2.2.0] - 2026-08-23
 
+### Fixed (pre-release code review)
+
+- `Entitlement.product_id` now carries the same
+  fall-back-to-`product_public_id` parsing as `LicenseState.product_id`,
+  so the alias contract ("either works") holds in both verification
+  modes — previously only the License Key API parser had the fallback.
+- `userinfo()` and the token endpoint now speak the same 429/5xx
+  contract as every other endpoint: 429 throws retriable
+  `UtaServerError` with `retryAfter` (a throttled token refresh is no
+  longer a `UtaTokenError`, which read as "log the user out"), and
+  their error messages cap quoted bodies like everywhere else.
+- The ~200-character error-body cap now applies to JSON bodies too — a
+  multi-kilobyte JSON error (gateway error with an embedded traceback
+  field) was previously quoted whole — and the truncation suffix
+  reports the amount actually cut.
+- The License Key API decode path shares `apiGetJson`'s object
+  validation: a JSON array response now throws instead of silently
+  decoding into an all-defaults (entitled: false) `LicenseState`.
+- `configure({client_secret_path})` now outranks an environment
+  `UTA_CLIENT_SECRET`: secret-pair precedence is decided per layer
+  (overrides → environment), not per key.
+- `ALLOWED_OVERRIDES` is derived from `UtaConfigOverrides` via
+  `satisfies`, so the typo guard can never drift into rejecting a
+  TypeScript-valid option.
+- `src/version.ts` is generated from `package.json` at build time (and
+  `prepublishOnly` runs the build), so `SDK_VERSION` can no longer ship
+  one release behind.
+- A 202 from `validateLicenseKey`/`regenerateLicenseKey` (off-contract
+  there) no longer throws the order-specific "retry in a few seconds"
+  `UtaOrderProcessingError`; only `getOrder` opts into 202 semantics.
+- The `UtaServiceNotEnabledError` message points at the manage page on
+  `https://www.usethatapp.com` — not the resolved `api_url`, which a
+  `configure({api_url})` override can aim at a host with no manage UI.
+- README: the 403 row and changelog name the add-on by its current
+  public name (Hosted sign-in), the 429/5xx rows document `retryAfter`,
+  the License Key API description no longer references the unexported
+  `resolveClientSecret()`, and the changelog section is dated 2.2.0 to
+  match CHANGELOG.md and package.json.
+
 ### Added
 
 - **License Key API** (server-side, bring-your-own-auth MoR

@@ -16,6 +16,7 @@ import {
   logoutUrl,
   refresh,
   resetConfig,
+  userinfo,
   resetDiscoveryCache,
   UtaAuthError,
   UtaConfigError,
@@ -259,12 +260,16 @@ test("getEntitlement maps 403 service_not_enabled to its own error", async () =>
   });
   await assert.rejects(getEntitlement("at-123"), UtaServiceNotEnabledError);
   await assert.rejects(getEntitlement("at-123"), UtaPermissionError);
-  // Glassbox F-10: the message names the CURRENT public feature name and
-  // points at the configured host, never a hardcoded usethatapp.com.
+  // Glassbox F-10: the message names the CURRENT public feature name.
+  // Code review (Python finding 10, same bug here — reversing F-10's
+  // host half): the manage hub lives on the production dashboard host;
+  // the configured api_url may be a dev stack with no manage UI, so the
+  // message must NOT point there.
   await assert.rejects(getEntitlement("at-123"), /Hosted sign-in/);
   await assert.rejects(getEntitlement("at-123"), (err) => {
     assert.ok(!String(err.message).includes("Auth & Entitlement"));
-    assert.ok(String(err.message).includes(API_URL));
+    assert.ok(String(err.message).includes("https://www.usethatapp.com"));
+    assert.ok(!String(err.message).includes(API_URL));
     return true;
   });
 });
@@ -389,4 +394,78 @@ test("SDK_VERSION is exported and matches package.json (J-12)", async () => {
   const { readFileSync } = await import("node:fs");
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
   assert.equal(SDK_VERSION, pkg.version);
+});
+
+// ── Pre-release code-review regressions ──────────────────────────────
+
+test("entitlement product_id falls back to product_public_id (finding 1)", async () => {
+  // The types.ts alias promise ("either works") must hold against a
+  // server that predates the identifier cutover — same fallback the
+  // LicenseState parser has.
+  routes.entitlement = () => json(200, {
+    entitled: true,
+    version: "Pro",
+    status: "active",
+    product_public_id: "prod_abc123",
+    // no product_id field at all
+  });
+  const ent = await getEntitlement("at-123");
+  assert.equal(ent.product_id, "prod_abc123");
+  assert.equal(ent.product_id, ent.product_public_id);
+});
+
+test("userinfo 429 is retriable with retryAfter (finding 2)", async () => {
+  routes.userinfo = () => json(429, "rate limited", { "retry-after": "30" });
+  await assert.rejects(userinfo("at-123"), (err) => {
+    assert.ok(err instanceof UtaServerError);
+    assert.equal(err.retryAfter, 30);
+    return true;
+  });
+});
+
+test("token endpoint 429 is not a credential failure (finding 2)", async () => {
+  // A throttled refresh must NOT be UtaTokenError — callers treat that
+  // as "log the user out" instead of backing off.
+  routes.token = () => json(429, "rate limited", { "retry-after": "15" });
+  await assert.rejects(refresh("rt-123"), (err) => {
+    assert.ok(err instanceof UtaServerError);
+    assert.ok(!(err instanceof UtaTokenError));
+    assert.equal(err.retryAfter, 15);
+    return true;
+  });
+});
+
+test("large JSON error bodies are capped too (finding 3)", async () => {
+  // JSON gets no exemption from the ~200-char cap: a gateway error with
+  // an embedded multi-KB field is the log-flooding the cap exists for.
+  const bigJson = JSON.stringify({ detail: "Traceback ".repeat(600) });
+  routes.entitlement = () => json(500, bigJson);
+  await assert.rejects(getEntitlement("at-123"), (err) => {
+    assert.ok(String(err.message).length < 300);
+    assert.ok(String(err.message).includes("truncated"));
+    return true;
+  });
+});
+
+test("configured client_secret_path outranks env UTA_CLIENT_SECRET (precedence)", async () => {
+  // Python review finding 2, same bug here: secret-pair precedence is
+  // per LAYER — a configure() override of either half must outrank both
+  // env vars.
+  const secretPath = join(mkdtempSync(join(tmpdir(), "uta-test-")), "secret");
+  writeFileSync(secretPath, "fresh-file-secret\n");
+  process.env.UTA_CLIENT_SECRET = "stale-env-secret";
+  try {
+    resetConfig();
+    configure({
+      client_id: CLIENT_ID,
+      redirect_uri: REDIRECT_URI,
+      issuer: ISSUER,
+      api_url: API_URL,
+      client_secret_path: secretPath,
+    });
+    const { loadConfig } = await import("../dist/index.js");
+    assert.equal(loadConfig(true).client_secret, "fresh-file-secret");
+  } finally {
+    delete process.env.UTA_CLIENT_SECRET;
+  }
 });
