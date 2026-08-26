@@ -3,17 +3,21 @@ export {
   completeLogin,
   getAppInfo,
   getEntitlement,
+  getOrder,
   getPrices,
   logoutUrl,
   manageUrl,
   purchaseUrl,
   refresh,
+  regenerateLicenseKey,
   userinfo,
+  validateLicenseKey,
   type BeginLoginOptions,
   type CompleteLoginArgs,
   type GetAppInfoOptions,
   type GetEntitlementOptions,
   type GetPricesOptions,
+  type LicenseApiOptions,
   type LogoutUrlOptions,
   type ManageUrlOptions,
   type PurchaseUrlOptions,
@@ -32,14 +36,20 @@ export {
 
 export { resetDiscoveryCache, type OidcMetadata } from "./discovery.js";
 
+export { SDK_VERSION } from "./version.js";
+
 export {
   UtaAuthError,
   UtaConfigError,
   UtaDiscoveryError,
   UtaError,
+  UtaLicenseCanceledError,
+  UtaNotFoundError,
+  UtaOrderProcessingError,
   UtaPermissionError,
+  UtaServiceNotEnabledError,
   UtaServerError,
   UtaTokenError,
 } from "./errors.js";
 
-export type { AppInfo, AppPrices, Entitlement, UtaFlowState, UtaPrice, UtaSession } from "./types.js";
+export type { AppInfo, AppPrices, Entitlement, LicenseState, UtaFlowState, UtaPrice, UtaSession } from "./types.js";

@@ -56,21 +56,40 @@ function readStr(name: string): string | undefined {
 /**
  * Resolve a secret from `UTA_FOO` or by reading the file at `UTA_FOO_PATH`.
  * The `*_PATH` variant supports hosting providers that mount secret files
- * (Render Secret Files, Fly volumes, k8s secret volumes, …). The direct
- * value wins if both are set; an empty direct value counts as unset, so a
- * blank env var can't shadow a mounted secret file.
+ * (Render Secret Files, Fly volumes, k8s secret volumes, …).
+ *
+ * Precedence is decided per LAYER (configure() overrides, then the
+ * environment), not per key: `configure({client_secret_path})` must
+ * outrank an env `UTA_CLIENT_SECRET`, or the developer's just-configured
+ * secret file silently loses to a stale deploy-env secret (the Python
+ * SDK review's finding 2 — the same bug existed here). Within a layer
+ * the direct value wins; an empty direct value counts as unset, so a
+ * blank var can't shadow a mounted secret file.
  */
 function readSecretOrPath(directName: string, pathName: string): string | undefined {
-  const direct = readStr(directName);
-  if (direct) return direct;
-  const path = readStr(pathName);
-  if (path === undefined) return undefined;
-  try {
-    return readFileSync(path, "utf8").trim();
-  } catch (e) {
-    const err = e instanceof Error ? e.message : String(e);
-    throw new UtaConfigError(`${pathName}=${path}: could not read file: ${err}`);
+  const layers: Array<(name: string) => string | undefined> = [
+    (name) => {
+      const key = name.toLowerCase().replace(/^uta_/, "") as keyof UtaConfigOverrides;
+      const v = _overrides[key];
+      if (v === undefined) return undefined;
+      if (typeof v !== "string") throw new UtaConfigError(`${name} must be a string`);
+      return v;
+    },
+    (name) => process.env[name],
+  ];
+  for (const layer of layers) {
+    const direct = layer(directName);
+    if (direct) return direct;
+    const path = layer(pathName);
+    if (path === undefined || path === "") continue;
+    try {
+      return readFileSync(path, "utf8").trim();
+    } catch (e) {
+      const err = e instanceof Error ? e.message : String(e);
+      throw new UtaConfigError(`${pathName}=${path}: could not read file: ${err}`);
+    }
   }
+  return undefined;
 }
 
 function readInt(name: string, fallback: number, min: number): number {
@@ -94,11 +113,39 @@ function readInt(name: string, fallback: number, min: number): number {
   return n;
 }
 
+// Derived from UtaConfigOverrides via `satisfies`, so adding an option
+// to the interface without listing it here is a COMPILE error — the typo
+// guard must not itself drift into rejecting valid options (review
+// finding 7).
+const OVERRIDE_KEYS = {
+  client_id: true,
+  client_secret: true,
+  client_secret_path: true,
+  redirect_uri: true,
+  issuer: true,
+  api_url: true,
+  scopes: true,
+  request_timeout_seconds: true,
+  clock_skew_seconds: true,
+} as const satisfies Record<keyof UtaConfigOverrides, true>;
+
+const ALLOWED_OVERRIDES = new Set<string>(Object.keys(OVERRIDE_KEYS));
+
 /**
  * Override one or more settings at runtime (useful for tests or apps that
  * prefer programmatic configuration over env vars). Clears the cached config.
+ *
+ * Unknown option names throw {@link UtaConfigError}, matching the Python
+ * SDK: TypeScript's excess-property check only guards object literals, so
+ * without this a typo from plain JavaScript (or a config object assembled
+ * elsewhere) was silently ignored — and the setting it was meant to change
+ * kept its default, e.g. api_url pointing at production (Quiver J-08).
  */
 export function configure(overrides: UtaConfigOverrides): void {
+  const unknown = Object.keys(overrides).filter((k) => !ALLOWED_OVERRIDES.has(k));
+  if (unknown.length > 0) {
+    throw new UtaConfigError(`unknown configure() option(s): ${unknown.sort().join(", ")}`);
+  }
   _overrides = { ..._overrides, ...overrides };
   _cached = null;
 }
@@ -128,6 +175,22 @@ export function resolveClientId(): string {
     throw new UtaConfigError("UTA_CLIENT_ID is required");
   }
   return clientId;
+}
+
+/**
+ * The app's OAuth client secret (`UTA_CLIENT_SECRET` /
+ * `UTA_CLIENT_SECRET_PATH`), required — the License Key API is
+ * server-side only and authenticates with client credentials.
+ */
+export function resolveClientSecret(): string {
+  const secret = readSecretOrPath("UTA_CLIENT_SECRET", "UTA_CLIENT_SECRET_PATH");
+  if (!secret) {
+    throw new UtaConfigError(
+      "UTA_CLIENT_SECRET is required for the License Key API " +
+        "(server-side calls authenticate with your app's client credentials)",
+    );
+  }
+  return secret;
 }
 
 /** Per-request timeout in seconds (`UTA_REQUEST_TIMEOUT_SECONDS`, default 10). */

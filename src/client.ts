@@ -16,22 +16,29 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { jwtVerify } from "jose";
 
 import {
+  DEFAULT_API_URL,
   loadConfig,
   resolveApiUrl,
   resolveClientId,
+  resolveClientSecret,
   resolveRequestTimeoutSeconds,
   type UtaConfig,
 } from "./config.js";
 import { getJwks, getMetadata, type OidcMetadata } from "./discovery.js";
 import {
   UtaAuthError,
+  UtaConfigError,
   UtaError,
+  UtaLicenseCanceledError,
+  UtaNotFoundError,
+  UtaOrderProcessingError,
   UtaPermissionError,
   UtaServerError,
+  UtaServiceNotEnabledError,
   UtaTokenError,
 } from "./errors.js";
 import { errMessage, fetchWithTimeout, type TimedResponse } from "./http.js";
-import type { AppInfo, AppPrices, Entitlement, UtaFlowState, UtaPrice, UtaSession } from "./types.js";
+import type { AppInfo, AppPrices, Entitlement, LicenseState, UtaFlowState, UtaPrice, UtaSession } from "./types.js";
 
 const ENTITLEMENT_PATH = "/licensing/entitlement/";
 const PUBLIC_APPS_PATH = "/api/v1/public/apps/";
@@ -198,10 +205,22 @@ export async function userinfo(accessToken: string): Promise<Record<string, unkn
   } catch (e) {
     throw new UtaServerError(`network error calling userinfo: ${errMessage(e)}`);
   }
-  if (resp.status === 401) throw new UtaTokenError(`401 from userinfo: ${resp.text}`);
-  if (resp.status === 403) throw new UtaPermissionError(`403 from userinfo: ${resp.text}`);
-  if (resp.status >= 500) throw new UtaServerError(`${resp.status} from userinfo`);
-  if (!resp.ok) throw new UtaError(`unexpected status ${resp.status} from userinfo: ${resp.text}`);
+  if (resp.status === 401) throw new UtaTokenError(`401 from userinfo: ${snippet(resp.text)}`);
+  if (resp.status === 403) throw new UtaPermissionError(`403 from userinfo: ${snippet(resp.text)}`);
+  // Same 429/5xx contract as every other endpoint (review finding 2):
+  // the backoff loop this release invites — catch UtaServerError, sleep
+  // e.retryAfter — must work when the SAME rate limiter throttles
+  // userinfo during login.
+  if (resp.status === 429) {
+    throw new UtaServerError(
+      `429 from userinfo — rate limited, retry with backoff: ${snippet(resp.text)}`,
+      resp.retryAfter,
+    );
+  }
+  if (resp.status >= 500) {
+    throw new UtaServerError(`${resp.status} from userinfo: ${snippet(resp.text)}`, resp.retryAfter);
+  }
+  if (!resp.ok) throw new UtaError(`unexpected status ${resp.status} from userinfo: ${snippet(resp.text)}`);
   try {
     return JSON.parse(resp.text) as Record<string, unknown>;
   } catch (e) {
@@ -341,10 +360,10 @@ export interface GetPricesOptions {
  * Fetch your app's public price list. Anonymous — no Authorization header
  * is sent, so no login is needed. Render your pricing from this API instead
  * of hardcoding amounts. Each price's `product_id` is the opaque `prod_…`
- * identifier to gate on — compare it against
- * {@link Entitlement.product_public_id} (`Entitlement.product_id` still
- * carries the legacy UUID until the platform's identifier cutover). Each
- * `buy_url` is the ready-made hosted checkout link.
+ * identifier to gate on — compare it against {@link Entitlement.product_id}
+ * or {@link Entitlement.product_public_id}: since the platform's identifier
+ * cutover they are a permanent equal-valued alias pair, so either works.
+ * Each `buy_url` is the ready-made hosted checkout link.
  */
 export async function getPrices(opts: GetPricesOptions = {}): Promise<AppPrices> {
   const url = resolveApiUrl() + PUBLIC_APPS_PATH + encodeURIComponent(resolveClientId()) + "/prices/";
@@ -369,8 +388,7 @@ async function tokenRequest(
   // Confidential clients use HTTP Basic (client_secret_basic); public
   // clients send client_id in the body and rely on PKCE.
   if (cfg.client_secret) {
-    headers.Authorization =
-      "Basic " + Buffer.from(`${cfg.client_id}:${cfg.client_secret}`).toString("base64");
+    headers.Authorization = basicAuth(cfg.client_id, cfg.client_secret);
   } else {
     body.set("client_id", cfg.client_id);
   }
@@ -386,8 +404,17 @@ async function tokenRequest(
     throw new UtaServerError(`network error calling token endpoint: ${errMessage(e)}`);
   }
   const text = resp.text;
+  // A throttled token refresh is retriable server pushback, not a
+  // credential failure — it must NOT surface as UtaTokenError, which
+  // callers treat as "log the user out" (review finding 2).
+  if (resp.status === 429) {
+    throw new UtaServerError(
+      `429 from token endpoint — rate limited, retry with backoff: ${snippet(text)}`,
+      resp.retryAfter,
+    );
+  }
   if (resp.status >= 500) {
-    throw new UtaServerError(`${resp.status} from token endpoint: ${text}`);
+    throw new UtaServerError(`${resp.status} from token endpoint: ${snippet(text)}`, resp.retryAfter);
   }
   let payload: Record<string, unknown>;
   try {
@@ -456,31 +483,85 @@ function sessionFromToken(
   };
 }
 
-function raiseForEntitlementStatus(status: number, bodyText: string): void {
+function raiseForEntitlementStatus(status: number, bodyText: string, retryAfter: number | null = null): void {
   if (status >= 200 && status < 300) return;
   if (status === 400) {
-    throw new UtaError(`400 from entitlement (client not linked to an app?): ${bodyText}`);
+    throw new UtaError(`400 from entitlement (client not linked to an app?): ${snippet(bodyText)}`);
   }
   if (status === 401) {
-    throw new UtaTokenError(`401 from entitlement — access token invalid/expired: ${bodyText}`);
+    throw new UtaTokenError(`401 from entitlement — access token invalid/expired: ${snippet(bodyText)}`);
   }
   if (status === 403) {
-    throw new UtaPermissionError(`403 from entitlement — missing 'entitlements' scope: ${bodyText}`);
+    // Two distinct 403s (see the server's EntitlementView contract):
+    // insufficient_scope (fix the requested scopes) vs service_not_enabled
+    // (the developer must enable the add-on — nothing here will fix it).
+    if (errorCode(bodyText) === "service_not_enabled") {
+      // The manage hub lives on the production dashboard host — NEVER
+      // the resolved api_url, which configure({api_url}) can point at a
+      // dev stack or gateway with no manage UI (Python review finding
+      // 10; same bug here).
+      throw new UtaServiceNotEnabledError(
+        "403 from entitlement — Hosted sign-in is not enabled for this " +
+        "app. The developer can turn on the Hosted sign-in add-on from " +
+        `the app's manage page on ${DEFAULT_API_URL} (Integration panel): ` +
+        snippet(bodyText),
+      );
+    }
+    throw new UtaPermissionError(`403 from entitlement — missing 'entitlements' scope: ${snippet(bodyText)}`);
   }
   if (status === 429) {
-    throw new UtaServerError(`429 from entitlement — rate limited, retry with backoff: ${bodyText}`);
+    throw new UtaServerError(`429 from entitlement — rate limited, retry with backoff: ${snippet(bodyText)}`, retryAfter);
   }
   if (status >= 500 && status < 600) {
-    throw new UtaServerError(`${status} from entitlement: ${bodyText}`);
+    throw new UtaServerError(`${status} from entitlement: ${snippet(bodyText)}`, retryAfter);
   }
-  throw new UtaError(`unexpected status ${status} from entitlement: ${bodyText}`);
+  throw new UtaError(`unexpected status ${status} from entitlement: ${snippet(bodyText)}`);
+}
+
+/**
+ * Error bodies get quoted into exception messages: collapsed to one line
+ * and capped at `limit` characters — uniformly. JSON gets no exemption: a
+ * gateway error with an embedded multi-KB traceback field parses as JSON
+ * and is exactly the log-flooding this cap exists to stop (review
+ * finding 3 — the old code returned anything JSON.parse accepted whole,
+ * and paid a throwaway parse to do it).
+ */
+function snippet(bodyText: string, limit = 200): string {
+  const collapsed = bodyText.trim().split(/\s+/).join(" ");
+  if (collapsed.length <= limit) return collapsed;
+  return collapsed.slice(0, limit) + `… [${collapsed.length - limit} more chars truncated]`;
+}
+
+/**
+ * The `error` field of a JSON error body, or "" when the body is not
+ * JSON / not an object / has no string error code.
+ */
+function errorCode(bodyText: string): string {
+  let data: unknown;
+  try {
+    data = JSON.parse(bodyText);
+  } catch {
+    return "";
+  }
+  if (typeof data !== "object" || data === null) return "";
+  const code = (data as Record<string, unknown>).error;
+  return typeof code === "string" ? code : "";
 }
 
 function parseEntitlement(obj: Record<string, unknown>): Entitlement {
   return {
     entitled: Boolean(obj.entitled),
     version: typeof obj.version === "string" ? obj.version : null,
-    product_id: typeof obj.product_id === "string" ? obj.product_id : null,
+    // Alias pair: fall back to product_public_id against a server that
+    // predates the identifier cutover — the same fallback
+    // parseLicenseState carries, so the types.ts promise ("either
+    // works") holds in BOTH verification modes (review finding 1).
+    product_id:
+      typeof obj.product_id === "string" && obj.product_id
+        ? obj.product_id
+        : typeof obj.product_public_id === "string"
+          ? obj.product_public_id
+          : null,
     product_public_id:
       typeof obj.product_public_id === "string" ? obj.product_public_id : null,
     status: typeof obj.status === "string" ? obj.status : "none",
@@ -496,7 +577,7 @@ async function apiGetJson(
   what: string,
   timeoutSeconds: number,
   headers: Record<string, string>,
-  raiseForStatus: (status: number, bodyText: string) => void,
+  raiseForStatus: (status: number, bodyText: string, retryAfter: number | null) => void,
 ): Promise<Record<string, unknown>> {
   let resp: TimedResponse;
   try {
@@ -504,10 +585,21 @@ async function apiGetJson(
   } catch (e) {
     throw new UtaServerError(`network error calling ${what}: ${errMessage(e)}`);
   }
-  raiseForStatus(resp.status, resp.text);
+  raiseForStatus(resp.status, resp.text, resp.retryAfter);
+  return decodeJsonObject(resp.text, what);
+}
+
+/**
+ * Decode a response body into a JSON object, rejecting non-objects AND
+ * arrays. Shared by apiGetJson and licenseApiRequest — the two used to
+ * hand-roll this and drifted: the license path lacked the Array.isArray
+ * rejection, so a JSON array silently decoded into an all-defaults
+ * LicenseState — a silent entitlement denial (review finding 4).
+ */
+function decodeJsonObject(text: string, what: string): Record<string, unknown> {
   let data: unknown;
   try {
-    data = JSON.parse(resp.text);
+    data = JSON.parse(text);
   } catch (e) {
     throw new UtaError(`${what} response is not valid JSON: ${errMessage(e)}`);
   }
@@ -523,25 +615,25 @@ function publicApiGet(
   what: string,
   timeoutSeconds: number,
 ): Promise<Record<string, unknown>> {
-  return apiGetJson(url, what, timeoutSeconds, {}, (status, bodyText) =>
-    raiseForPublicApiStatus(status, what, bodyText),
+  return apiGetJson(url, what, timeoutSeconds, {}, (status, bodyText, retryAfter) =>
+    raiseForPublicApiStatus(status, what, bodyText, retryAfter),
   );
 }
 
-function raiseForPublicApiStatus(status: number, what: string, bodyText: string): void {
+function raiseForPublicApiStatus(status: number, what: string, bodyText: string, retryAfter: number | null = null): void {
   if (status >= 200 && status < 300) return;
   if (status === 404) {
     throw new UtaError(
-      `404 from ${what} — app unknown, unpublished, or external sales not enabled: ${bodyText}`,
+      `404 from ${what} — app unknown, unpublished, or external sales not enabled: ${snippet(bodyText)}`,
     );
   }
   if (status === 429) {
-    throw new UtaServerError(`429 from ${what} — rate limited, retry with backoff: ${bodyText}`);
+    throw new UtaServerError(`429 from ${what} — rate limited, retry with backoff: ${snippet(bodyText)}`, retryAfter);
   }
   if (status >= 500 && status < 600) {
-    throw new UtaServerError(`${status} from ${what}: ${bodyText}`);
+    throw new UtaServerError(`${status} from ${what}: ${snippet(bodyText)}`, retryAfter);
   }
-  throw new UtaError(`unexpected status ${status} from ${what}: ${bodyText}`);
+  throw new UtaError(`unexpected status ${status} from ${what}: ${snippet(bodyText)}`);
 }
 
 function parseAppInfo(obj: Record<string, unknown>): AppInfo {
@@ -581,4 +673,181 @@ function parsePrices(obj: Record<string, unknown>): AppPrices {
     prices: Array.isArray(obj.prices) ? obj.prices.map(parsePrice) : [],
     raw: obj,
   };
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// License Key API (bring-your-own-auth MoR verification)
+// ──────────────────────────────────────────────────────────────────────
+//
+// Server-to-server only: authenticated with your app's OAuth client id
+// and secret over HTTP Basic. No end user, no browser, no OIDC — this is
+// how an app that keeps its own auth verifies UseThatApp purchases.
+
+/** HTTP Basic credentials header — shared by the token endpoint and the
+ * License Key API (was duplicated; review cut-list). */
+function basicAuth(clientId: string, secret: string): string {
+  return "Basic " + Buffer.from(`${clientId}:${secret}`, "utf8").toString("base64");
+}
+
+function licenseApiAuthHeader(): string {
+  return basicAuth(resolveClientId(), resolveClientSecret());
+}
+
+function raiseForLicenseApiStatus(status: number, bodyText: string, retryAfter: number | null = null): void {
+  if (status >= 200 && status < 300) return;
+  const code = errorCode(bodyText);
+  if (status === 401) {
+    throw new UtaConfigError(
+      `client credentials rejected — check UTA_CLIENT_ID / UTA_CLIENT_SECRET: ${snippet(bodyText)}`,
+    );
+  }
+  if (status === 404) {
+    throw new UtaNotFoundError(`${code || "not found"}: ${snippet(bodyText)}`, code);
+  }
+  if (status === 409) {
+    throw new UtaLicenseCanceledError(
+      `license is canceled — its key cannot be regenerated: ${snippet(bodyText)}`,
+    );
+  }
+  if (status === 400) throw new UtaError(`400 from license API: ${snippet(bodyText)}`);
+  if (status === 429) {
+    throw new UtaServerError(`429 from license API — rate limited, retry with backoff: ${snippet(bodyText)}`, retryAfter);
+  }
+  if (status >= 500 && status < 600) {
+    throw new UtaServerError(`${status} from license API: ${snippet(bodyText)}`, retryAfter);
+  }
+  throw new UtaError(`unexpected status ${status} from license API: ${snippet(bodyText)}`);
+}
+
+function parseLicenseState(obj: Record<string, unknown>): LicenseState {
+  return {
+    entitled: Boolean(obj.entitled),
+    status: typeof obj.status === "string" ? obj.status : "",
+    license_id: typeof obj.license_id === "string" ? obj.license_id : "",
+    product_public_id:
+      typeof obj.product_public_id === "string" ? obj.product_public_id : "",
+    // Alias pair: fall back to product_public_id against a server that
+    // predates the identifier cutover.
+    product_id:
+      typeof obj.product_id === "string" && obj.product_id
+        ? obj.product_id
+        : typeof obj.product_public_id === "string"
+          ? obj.product_public_id
+          : "",
+    period_end: typeof obj.period_end === "string" ? obj.period_end : null,
+    canceled_at: typeof obj.canceled_at === "string" ? obj.canceled_at : null,
+    license_key: typeof obj.license_key === "string" ? obj.license_key : null,
+    rotated_at: typeof obj.rotated_at === "string" ? obj.rotated_at : null,
+  };
+}
+
+async function licenseApiRequest(
+  method: string,
+  path: string,
+  body: unknown,
+  timeoutSeconds: number | undefined,
+  orderProcessingOn202 = false,
+): Promise<LicenseState> {
+  const url = resolveApiUrl() + path;
+  const timeout = timeoutSeconds ?? resolveRequestTimeoutSeconds();
+  // Resolve credentials BEFORE the try: a missing secret is a config
+  // error, and the catch below must wrap only genuine network failures.
+  const authorization = licenseApiAuthHeader();
+  let resp;
+  try {
+    resp = await fetchWithTimeout(
+      url,
+      {
+        method,
+        headers: {
+          Authorization: authorization,
+          ...(body !== undefined ? { "content-type": "application/json" } : {}),
+        },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      },
+      timeout,
+    );
+  } catch (e) {
+    throw new UtaServerError(`network error calling license API: ${errMessage(e)}`);
+  }
+  if (resp.status === 202) {
+    // 202 is the ORDER endpoint's "payment cleared, license pending"
+    // signal — only getOrder opts into it. Anywhere else it is
+    // off-contract, and the order-specific retry message would steer
+    // retry loops at the wrong endpoint (review finding 9).
+    if (orderProcessingOn202) {
+      throw new UtaOrderProcessingError(
+        "order confirmed but its license hasn't landed yet — retry in a few seconds",
+      );
+    }
+    throw new UtaError(`unexpected status 202 from license API: ${snippet(resp.text)}`);
+  }
+  raiseForLicenseApiStatus(resp.status, resp.text, resp.retryAfter);
+  return parseLicenseState(decodeJsonObject(resp.text, "license API"));
+}
+
+export interface LicenseApiOptions {
+  timeoutSeconds?: number;
+}
+
+/**
+ * The live state of a license key your user presented.
+ *
+ * Throws {@link UtaNotFoundError} (`code="unknown_key"`) for a key
+ * UseThatApp never issued for your app. A canceled purchase does NOT
+ * throw — it returns `entitled=false, status="canceled"`, because a key
+ * you once accepted deserves a lifecycle answer, not an error.
+ */
+export async function validateLicenseKey(
+  key: string,
+  opts: LicenseApiOptions = {},
+): Promise<LicenseState> {
+  if (!key) throw new UtaError("key must be a non-empty string");
+  return licenseApiRequest(
+    "POST", "/api/v1/licenses/validate", { key }, opts.timeoutSeconds,
+  );
+}
+
+/**
+ * Exchange the `uta_order` handback for the buyer's license key.
+ *
+ * `ref` arrives as the `uta_order` query parameter on your post-checkout
+ * return URL. The result carries `license_key` — link it to your own
+ * signed-in user and you never need email matching. Throws
+ * {@link UtaOrderProcessingError} when the payment cleared but the
+ * license hasn't landed yet (retry briefly), and {@link UtaNotFoundError}
+ * (`code="unknown_order"`) for a bad or expired ref.
+ */
+export async function getOrder(
+  ref: string,
+  opts: LicenseApiOptions = {},
+): Promise<LicenseState> {
+  if (!ref) throw new UtaError("ref must be a non-empty string");
+  return licenseApiRequest(
+    "GET", "/api/v1/orders/" + encodeURIComponent(ref), undefined,
+    opts.timeoutSeconds, /* orderProcessingOn202 */ true,
+  );
+}
+
+/**
+ * Mint a replacement key for one license; the old key dies now.
+ *
+ * The compromise kill switch — a merely-lost key is self-serve for the
+ * buyer on their UseThatApp management page, so reach for this only when
+ * a key must be revoked. The result's `license_key` is the new key;
+ * deliver it to your customer yourself. Throws {@link UtaNotFoundError}
+ * (`code="unknown_license"`) for a license that isn't your app's, and
+ * {@link UtaLicenseCanceledError} for a terminally canceled one.
+ */
+export async function regenerateLicenseKey(
+  licenseId: string,
+  opts: LicenseApiOptions = {},
+): Promise<LicenseState> {
+  if (!licenseId) throw new UtaError("licenseId must be a non-empty string");
+  return licenseApiRequest(
+    "POST",
+    `/api/v1/licenses/${encodeURIComponent(licenseId)}/regenerate-key`,
+    undefined,
+    opts.timeoutSeconds,
+  );
 }
