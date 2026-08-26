@@ -244,7 +244,7 @@ npm test        # build + node:test suite
 
 ## Changelog
 
-### 2.2.0 (2026-08-23)
+### 2.2.0 (2026-08-25)
 
 **Added**
 
