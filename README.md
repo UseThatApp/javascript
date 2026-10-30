@@ -142,6 +142,8 @@ await db.save({ user: currentUser, licenseKey: order.license_key, licenseId: ord
 // 2) Any time you need the truth (app start, feature gate, cron):
 const state = await validateLicenseKey(storedKey); // LicenseState
 if (state.entitled) { /* cache against state.period_end */ }
+// state.is_trial: in a free trial — entitled, nothing charged yet, and
+// period_end is the conversion date. Show a banner; gate nothing extra.
 // canceled purchases return entitled=false, status="canceled" — an
 // answer, not an exception. UtaNotFoundError means a key that was
 // never issued for your app.
@@ -362,7 +364,7 @@ an OpenID Provider; the SDK is a framework-agnostic OIDC client.
   `iss`/`aud`/`exp`/`nonce`) with `jose`.
 - `refresh(refreshToken)`, `userinfo(accessToken)`, `logoutUrl({...})`.
 - `getEntitlement(accessToken)` → `Entitlement(entitled, version, product_id,
-  status, is_free, period_end)`, the Bearer replacement for `getVersion`.
+  status, is_free, is_trial, period_end)`, the Bearer replacement for `getVersion`.
 - `UtaSession` (pairwise pseudonymous `sub` + tokens), `Entitlement`,
   `UtaFlowState`.
 - New config: `UTA_CLIENT_ID`, `UTA_CLIENT_SECRET[_PATH]`, `UTA_REDIRECT_URI`,

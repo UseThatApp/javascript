@@ -116,6 +116,15 @@ export interface Entitlement {
   readonly status: string;
   /** True when the entitlement comes from the app's free tier. */
   readonly is_free: boolean;
+  /**
+   * True while the user is in a free trial of a paid plan: they are
+   * entitled to the plan's real functionality and nothing has been charged
+   * yet. While true, `period_end` is the date the trial converts (the first
+   * charge). A trial the user cancels keeps `entitled` until that date and
+   * then drops it — the entitlement is live, so never cache past
+   * `period_end`. Explicit so you never string-match `status`.
+   */
+  readonly is_trial: boolean;
   /** ISO date the current license period ends, or `null`. */
   readonly period_end: string | null;
   /** The full decoded response, for forward-compatibility. */
@@ -132,6 +141,8 @@ export interface Entitlement {
 export interface LicenseState {
   readonly entitled: boolean;
   readonly status: string;
+  /** True while the license is in its free trial (see {@link Entitlement.is_trial}). */
+  readonly is_trial: boolean;
   readonly license_id: string;
   /**
    * The opaque `prod_…` product identifier. `product_id` and

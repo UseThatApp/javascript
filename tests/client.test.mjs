@@ -232,6 +232,7 @@ test("getEntitlement returns a licensed entitlement", async () => {
   assert.equal(ent.product_id, "p-1");
   assert.equal(ent.status, "active");
   assert.equal(ent.is_free, false);
+  assert.equal(ent.is_trial, false);
   assert.equal(ent.period_end, "2026-07-01");
 });
 
@@ -468,4 +469,16 @@ test("configured client_secret_path outranks env UTA_CLIENT_SECRET (precedence)"
   } finally {
     delete process.env.UTA_CLIENT_SECRET;
   }
+});
+
+test("getEntitlement: a trialing licence is_trial with period_end as the conversion date", async () => {
+  routes.entitlement = () => json(200, {
+    entitled: true, version: "Pro", product_id: "prod_abc", product_public_id: "prod_abc",
+    status: "trialing", is_free: false, is_trial: true, period_end: "2026-11-11",
+  });
+  const ent = await getEntitlement("at-123");
+  assert.equal(ent.entitled, true);
+  assert.equal(ent.is_trial, true);
+  assert.equal(ent.status, "trialing");
+  assert.equal(ent.period_end, "2026-11-11");
 });
