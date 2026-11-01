@@ -1,6 +1,6 @@
 {
   "name": "usethatapp",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "JavaScript/TypeScript SDK for usethatapp.com \u2014 OpenID Connect login and live license entitlement queries.",
   "type": "module",
   "main": "./dist/index.js",

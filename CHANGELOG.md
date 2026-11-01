@@ -5,6 +5,16 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-10-29
+
+### Added
+
+- `Entitlement.is_trial` and `LicenseState.is_trial`: true while the user
+  is in a free trial of a paid plan (entitled, nothing charged yet;
+  `period_end` is the conversion date). Explicit so integrations never
+  string-match `status === "trialing"`. Servers that predate the field
+  decode as `false`.
+
 ## [2.2.0] - 2026-08-25
 
 ### Fixed (pre-release code review)

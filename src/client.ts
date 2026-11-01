@@ -566,6 +566,7 @@ function parseEntitlement(obj: Record<string, unknown>): Entitlement {
       typeof obj.product_public_id === "string" ? obj.product_public_id : null,
     status: typeof obj.status === "string" ? obj.status : "none",
     is_free: Boolean(obj.is_free),
+    is_trial: Boolean(obj.is_trial),
     period_end: typeof obj.period_end === "string" ? obj.period_end : null,
     raw: obj,
   };
@@ -734,6 +735,7 @@ function parseLicenseState(obj: Record<string, unknown>): LicenseState {
         : typeof obj.product_public_id === "string"
           ? obj.product_public_id
           : "",
+    is_trial: Boolean(obj.is_trial),
     period_end: typeof obj.period_end === "string" ? obj.period_end : null,
     canceled_at: typeof obj.canceled_at === "string" ? obj.canceled_at : null,
     license_key: typeof obj.license_key === "string" ? obj.license_key : null,
