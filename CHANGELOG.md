@@ -5,6 +5,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Documentation
+
+- README rewritten around the default integration: license keys first,
+  then prices and buy links, with Hosted sign-in as the optional add-on.
+  Corrected stale claims (purchases are open to international buyers;
+  external sales is on by default; `Entitlement.product_id` already
+  carries the `prod_…` id; a cancellation keeps access until
+  `period_end`; seller apps always use a confidential client, so the
+  secret is never optional). The changelog that was duplicated in the
+  README, and the v1 migration table, now live only here.
+- New `examples/license-keys-express` app for the license-key flow.
+
 ## [2.3.0] - 2026-10-29
 
 ### Added
@@ -103,9 +115,127 @@ project adheres to [Semantic Versioning](https://semver.org/).
   ~200 characters when quoted into error messages, instead of inlining
   the entire page.
 
-## [2.1.0] and earlier
+## [2.1.0] - 2026-08-11
 
-Releases before 2.2.0 predate this changelog. 2.1.0 (on npm) added the
-purchase surface (`purchaseUrl`, `manageUrl`, `getPrices`,
-`getAppInfo`) and `Entitlement.product_public_id`; 2.0.0 was the
-OpenID Connect rewrite.
+Thin support for selling your app from your own website (hosted purchase
+links, buyer management page, public pricing API), plus OIDC hardening.
+The new surface is additive, but the hardening tightens some previously
+lax behavior — see *Security* and *Changed* below before upgrading.
+
+### Added
+
+- `purchaseUrl(priceId, { next, ref, email })` — pure builder for the hosted
+  checkout URL of a price.
+- `manageUrl({ next })` — pure builder for the buyer's subscription-management
+  page URL for your app.
+- `getAppInfo()` → `AppInfo` — the app's public listing info (anonymous, no
+  auth).
+- `getPrices()` → `AppPrices` — the app's public price list (anonymous, no
+  auth); each `UtaPrice` carries a ready-made `buy_url` and a `product_id`
+  matching `Entitlement.product_public_id` (not the legacy
+  `Entitlement.product_id` UUID).
+- New types: `AppInfo`, `AppPrices`, `UtaPrice`.
+- `Entitlement.product_public_id` — the opaque public product identifier
+  (`prod_…`) matching `UtaPrice.product_id` from the pricing API. New
+  integrations should gate on it; `Entitlement.product_id` currently
+  carries a legacy UUID and will converge on the same `prod_…` value.
+
+### Security
+
+These close real gaps in 2.0.0's OIDC flow. Each one turns a case that
+used to pass silently into a thrown error, so an integration relying on
+the old leniency will now see an exception instead.
+
+- **Discovery issuer is verified.** A discovery document whose `issuer`
+  does not match the configured `UTA_ISSUER` is rejected with
+  `UtaDiscoveryError` (and never cached). Previously ID tokens were
+  validated against whatever `issuer`/`jwks_uri` the document declared,
+  so a misconfigured or hostile discovery endpoint could get tokens from
+  a different issuer accepted.
+- **A missing nonce no longer skips replay protection.** `completeLogin`
+  throws `UtaAuthError` when `flowState` lacks `nonce`/`codeVerifier` —
+  e.g. when a session layer drops fields — instead of silently omitting
+  the nonce check.
+- **`userinfo()` rejects every non-2xx response** (403 →
+  `UtaPermissionError`), and `refresh()` throws `UtaTokenError` on a
+  missing/empty `sub`. Previously a 403/404/400 error body was returned
+  as claims, producing a session with `sub === ""` that collided every
+  affected user onto one identity.
+- **`beginLogin` rejects reserved `extraParams`.** Passing a key that
+  collides with `state`, `nonce`, `code_challenge`, `redirect_uri`,
+  `client_id`, … now throws `UtaError` rather than overwriting the value
+  recorded in `flowState` and breaking CSRF/PKCE protection.
+- **An empty `UTA_CLIENT_SECRET` no longer shadows
+  `UTA_CLIENT_SECRET_PATH`.** A blank env var now falls through to the
+  mounted secret file instead of demoting the app to a public client.
+
+### Changed
+
+- Request timeouts now cover the response body, not just the headers. A
+  server that sends headers and then stalls fails after
+  `UTA_REQUEST_TIMEOUT_SECONDS` instead of hanging indefinitely.
+- `UTA_REQUEST_TIMEOUT_SECONDS` must be ≥ 1 and `UTA_CLOCK_SKEW_SECONDS`
+  ≥ 0; out-of-range values raise `UtaConfigError` at config load.
+  Previously `0` was accepted and aborted every request immediately.
+- `getEntitlement` maps 429 to `UtaServerError` (retriable with backoff)
+  instead of a generic non-retriable `UtaError`, matching the public
+  pricing endpoints.
+
+### Fixed
+
+- Gating guidance: the quickstart and `getPrices` docs now compare a
+  price's `product_id` against `Entitlement.product_public_id`. The old
+  wording pointed at `Entitlement.product_id`, whose legacy UUID makes
+  the comparison false for every buyer.
+- The example apps map `UtaServerError` to HTTP 502 rather than 400, so
+  a provider outage is not reported as a client error.
+
+## [2.0.0]
+
+Breaking rewrite onto standard OAuth2 / OpenID Connect. usethatapp.com is now
+an OpenID Provider; the SDK is a framework-agnostic OIDC client.
+
+### Migrating from 1.x
+
+| 1.x | 2.x |
+|---|---|
+| `getUser(payload)` (decrypt envelope) | `beginLogin()` + `completeLogin()` (OIDC) |
+| `UtaUser.user_key` | `UtaSession.sub` (pairwise, stable per app) |
+| `getVersion(userKey) => string | null` | `getEntitlement(accessToken) => Entitlement` |
+| RSA keys (`UTA_PRIVATE_KEY`, market key) | OAuth client (`UTA_CLIENT_ID` / `UTA_CLIENT_SECRET`) |
+| `UTA_APP_ID` | Gone: the client id identifies your app |
+| `utaLaunchView` Express helper | Gone: wire your own callback route |
+
+### Removed
+
+- `getUser` / `getUserFromRequest` and the encrypted launch-envelope handling.
+- `getVersion` / `clearVersionCache` and the process-local version cache.
+- `utaLaunchView` Express helper — the SDK ships no framework-specific code.
+- `UtaUser` (and its `user_key` / `version_hint`).
+- RSA-key config (`UTA_PRIVATE_KEY[_PATH]`, `UTA_MARKET_PUBLIC_KEY[_PATH]`)
+  and `UTA_APP_ID`.
+
+### Added
+
+- OIDC login: `beginLogin()` → `{ authorizationUrl, flowState }` (auth code +
+  PKCE); `completeLogin({ code, state, flowState })` → `UtaSession`, validating
+  `state`, exchanging the code, and verifying the ID token (signature via JWKS,
+  `iss`/`aud`/`exp`/`nonce`) with `jose`.
+- `refresh(refreshToken)`, `userinfo(accessToken)`, `logoutUrl({...})`.
+- `getEntitlement(accessToken)` → `Entitlement(entitled, version, product_id,
+  status, is_free, period_end)`, the Bearer replacement for `getVersion`.
+- `UtaSession` (pairwise pseudonymous `sub` + tokens), `Entitlement`,
+  `UtaFlowState`.
+- New config: `UTA_CLIENT_ID`, `UTA_CLIENT_SECRET[_PATH]`, `UTA_REDIRECT_URI`,
+  `UTA_ISSUER`, `UTA_SCOPES`.
+- New typed errors: `UtaDiscoveryError`, `UtaAuthError`, `UtaTokenError`,
+  `UtaPermissionError`.
+
+### Changed
+
+- One runtime dependency: `jose`. Identity is a pairwise, per-app pseudonymous
+  `sub` — stable within your app, uncorrelatable across apps.
+
+## [1.0.0]
+
+Breaking rewrite for the (now superseded) webhook-based launch-envelope handoff.
